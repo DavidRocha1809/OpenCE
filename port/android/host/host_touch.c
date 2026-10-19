@@ -42,6 +42,7 @@ static int64_t gyro_ns;
 static int rumble_amplitude;
 static int64_t rumble_ns;
 static volatile int touch_scene;
+static volatile int touch_hud_active;
 /* the game control on each controller button (-1: none), and a count of
 its changes, which the overlay polls */
 #define TOUCH_BUTTONS 16
@@ -226,4 +227,62 @@ JNIEXPORT jint JNICALL Java_com_halo_decomp_TouchControls_nativeScene(JNIEnv *en
 	(void)env;
 	(void)cls;
 	return touch_scene;
+}
+
+/* Touch weapon-slot state is published by the guest game once per input read.
+ * Reading/switching requests only cross threads under touch_lock. */
+static int32_t touch_weapon_slots[9] = {-1, -1, -1, -1, -1, -1, -1, -1, -1};
+static int32_t touch_weapon_request = -1;
+
+void host_touch_weapon_slots(const int *slots)
+{
+    pthread_mutex_lock(&touch_lock);
+    memcpy(touch_weapon_slots, slots, sizeof(touch_weapon_slots));
+    pthread_mutex_unlock(&touch_lock);
+}
+
+int host_touch_weapon_request(void)
+{
+    int slot;
+    pthread_mutex_lock(&touch_lock);
+    slot = touch_weapon_request;
+    touch_weapon_request = -1;
+    pthread_mutex_unlock(&touch_lock);
+    return slot;
+}
+
+JNIEXPORT void JNICALL Java_com_halo_decomp_TouchControls_nativeWeaponSlots(
+    JNIEnv *env, jclass cls, jintArray state)
+{
+    int32_t slots[9];
+    (void)cls;
+    if (!state || (*env)->GetArrayLength(env, state) < 9) return;
+    pthread_mutex_lock(&touch_lock);
+    memcpy(slots, touch_weapon_slots, sizeof(slots));
+    pthread_mutex_unlock(&touch_lock);
+    (*env)->SetIntArrayRegion(env, state, 0, 9, (const jint *)slots);
+}
+
+JNIEXPORT void JNICALL Java_com_halo_decomp_TouchControls_nativeSelectWeaponSlot(
+    JNIEnv *env, jclass cls, jint slot)
+{
+    (void)env; (void)cls;
+    if (slot < 0 || slot > 1) return;
+    pthread_mutex_lock(&touch_lock);
+    touch_weapon_request = slot;
+    pthread_mutex_unlock(&touch_lock);
+}
+
+/* Only the Android on-screen gameplay UI owns the customized radar and
+ * native weapon sprites. Controller devices restore the original Halo HUD. */
+JNIEXPORT void JNICALL Java_com_halo_decomp_TouchControls_nativeTouchHudActive(
+    JNIEnv *env, jclass cls, jboolean active)
+{
+    (void)env; (void)cls;
+    touch_hud_active = active ? 1 : 0;
+}
+
+int host_touch_hud_active(void)
+{
+    return touch_hud_active;
 }

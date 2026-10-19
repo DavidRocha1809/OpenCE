@@ -85,6 +85,7 @@ symbols in this file:
 #include "game/game_globals.h"
 #include "game/players.h"
 #include "interface/hud.h"
+#include "interface/hud_draw.h"
 #include "interface/hud_definitions.h"
 #include "interface/hud_messaging.h"
 #include "interface/hud_unit.h"
@@ -1398,6 +1399,65 @@ static void temporary_hud_draw(
 	return;
 }
 
+#ifdef HALO_ANDROID
+/* Original weapon pickup sprites, drawn by Halo while its texture cache is
+ * available. Android only paints the transparent selection frames above them.
+ * Coordinates mirror TouchControls.weaponFrame() for a single fullscreen view;
+ * this is a first-pass alignment test, not a permanent multi-viewport layout. */
+extern void touch_game_weapon_slots(int slots[9], int requested);
+extern int host_touch_hud_active(void);
+static void touch_draw_original_weapon_icons(void)
+{
+    int slots[9];
+    long group_index;
+    real height, half_width;
+    int i;
+    if (!hud_globals || !host_touch_hud_active()) return;
+    group_index = hud_globals->messaging.messaging_icons.index;
+    if (group_index == NONE) return;
+    touch_game_weapon_slots(slots, -1);
+    height = (real)(render.camera.window_bounds.y1 - render.camera.window_bounds.y0);
+    half_width = (real)(render.camera.window_bounds.x1 - render.camera.window_bounds.x0) * 0.5f;
+    if (height <= 0) return;
+    for (i = 0; i < 2; i++)
+    {
+        struct bitmap_data const *bitmap = NULL;
+        real_rectangle2d const *clip = NULL;
+        real width, sprite_height, scale, max_width, max_height;
+        point2d point;
+        pixel32 color;
+        if (slots[i] < 0 || slots[3+i] < 0) continue;
+        hud_retrieve_bitmap_and_bounding_rect(group_index, (short)slots[3+i], 0,
+            &bitmap, &clip);
+        if (!bitmap || !_texture_cache_bitmap_get_hardware_format((struct bitmap_data *)bitmap, FALSE, TRUE))
+            continue;
+        width = (real)bitmap->width * (clip ? clip->x1 - clip->x0 : 1.0f);
+        sprite_height = (real)bitmap->height * (clip ? clip->y1 - clip->y0 : 1.0f);
+        if (width <= 0 || sprite_height <= 0) continue;
+        max_width = 86.0f * height / 540.0f;
+        max_height = 29.0f * height / 540.0f;
+        scale = max_width / width;
+        if (scale > max_height / sprite_height) scale = max_height / sprite_height;
+        if (scale > 1.0f) scale = 1.0f;
+        /* Calibration for Android's widescreen overlay: the native HUD's
+         * camera window is not identical to the Java view's full surface.
+         * In the 1600x720 test capture the icons were above and left of the
+         * weapon frames. Step 3C brought them into the slots; Step 3D nudges
+         * them lower and a touch to the right to centre them better inside
+         * the Java-drawn frames. Step 3E lowers them a little more after the
+         * follow-up screen test. Step 3F shifts them slightly right. */
+        point.x = (short)(half_width + 0.182f * height
+            + ((i == 0) ? -63.0f : 63.0f) * height / 540.0f
+            - width * scale * 0.5f);
+        point.y = (short)(height - (7.0f + 21.5f) * height / 540.0f
+            + 0.170f * height - sprite_height * scale * 0.5f);
+        color = (slots[7+i] & (1 << 1)) ? (pixel32)slots[5+i] : 0xFFFFFFFF;
+        hud_draw_bitmap_direct(bitmap, _hud_anchor_top_left, &point, clip,
+            scale, 0.0f, color, FALSE);
+    }
+}
+#endif
+
 void hud_draw_screen(
 	void)
 {
@@ -1455,6 +1515,11 @@ void hud_draw_screen(
 			hud_play_unit_sounds(player, FALSE);
 		}
 
+#ifdef HALO_ANDROID
+        if (hud_scripted_globals->show_hud && player->unit_index != NONE &&
+            render.local_player_index == 0 && !cinematic_in_progress())
+            touch_draw_original_weapon_icons();
+#endif
 		hud_messaging_update(render.local_player_index);
 		/* port: network games' text chat, the lines this view's player hears */
 		network_chat_draw(render.local_player_index);

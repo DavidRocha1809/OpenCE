@@ -25,6 +25,10 @@ void host_touch_read(int *state);
 void host_touch_look_read(float *delta);
 void host_touch_rumble(unsigned int low, unsigned int high);
 void host_touch_scene(int scene);
+#ifdef HALO_ANDROID
+void host_touch_weapon_slots(const int *slots);
+int host_touch_weapon_request(void);
+#endif
 void host_touch_bindings(const int *controls);
 #endif
 
@@ -33,6 +37,9 @@ int touch_game_cinematic_skippable(void);
 int touch_game_cinematic_playing(void);
 int touch_game_playing(void);
 void touch_game_button_controls(int *controls);
+#ifdef HALO_ANDROID
+void touch_game_weapon_slots(int slots[9], int requested);
+#endif
 
 /* the gamepad's buttons (input.h), which the touch controls are named by */
 #define TOUCH_BUTTONS 16
@@ -299,6 +306,13 @@ void touch_input_controls(XINPUT_GAMEPAD *pad, int menus)
 		bindings_known = TRUE;
 		host_touch_bindings(bindings);
 	}
+#ifdef HALO_ANDROID
+    {
+        int slots[9];
+        touch_game_weapon_slots(slots, host_touch_weapon_request());
+        host_touch_weapon_slots(slots);
+    }
+#endif
 	host_touch_read(state);
 	/* the stick moves the player through the game's input state, whatever
 	the profile's sticks do (touch_input_move), not as the left stick */

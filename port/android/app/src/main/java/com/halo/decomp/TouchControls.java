@@ -4,9 +4,13 @@ import android.app.AlertDialog;
 import android.content.Context;
 import android.content.SharedPreferences;
 import android.content.pm.PackageManager;
+import android.graphics.Bitmap;
+import android.graphics.BitmapFactory;
 import android.graphics.Canvas;
 import android.graphics.Color;
 import android.graphics.Paint;
+import android.graphics.Path;
+import android.graphics.RectF;
 import android.hardware.Sensor;
 import android.hardware.SensorEvent;
 import android.hardware.SensorEventListener;
@@ -58,6 +62,12 @@ public final class TouchControls extends View implements SensorEventListener, In
     private static final int TOOLBAR_IMPORT = -7;
     private static final float TOOLBAR_RADIUS = 28;
     private static final float OPTIONS_RADIUS = 34;
+    private Bitmap jumpIconBitmap;
+    private Bitmap fireIconBitmap;
+    private Bitmap meleeIconBitmap;
+
+
+    private Bitmap crouchIconBitmap;
 
     /** the logical grid the controls are laid out on, scaled to the display's height */
     private static final float GRID_WIDTH = 960;
@@ -151,7 +161,10 @@ public final class TouchControls extends View implements SensorEventListener, In
     private static native void nativeGyro(float dx, float dy);
     private static native void nativeLookReset();
     private static native int nativeRumble();
+    private static native void nativeTouchHudActive(boolean active);
     private static native int nativeScene();
+    private static native void nativeWeaponSlots(int[] state);
+    private static native void nativeSelectWeaponSlot(int slot);
     private static native int nativeBindings(int[] controls);
 
     private final Paint paint = new Paint(Paint.ANTI_ALIAS_FLAG);
@@ -184,6 +197,7 @@ public final class TouchControls extends View implements SensorEventListener, In
     private final SparseArray<float[]> toolbarFingers = new SparseArray<>();
     private final int[] axes = new int[6];
     private int lookPointer = -1;
+    private long lookEventTime = -1;
     private float lookX;
     private float lookY;
     /** a floating stick's centre while a thumb holds it (logical units) */
@@ -215,6 +229,10 @@ public final class TouchControls extends View implements SensorEventListener, In
     private final int[] bindings = DEFAULT_BINDINGS.clone();
     private final int[] bindingsRead = new int[bindings.length];
     private int bindingsSerial;
+    // [0..1] weapon kind, [2] active slot; [3..4] Halo HUD sprite sequence,
+    // [5..6] packed icon colors, [7..8] icon flags. Filled by the native engine.
+    private final int[] weaponSlots = {-1, -1, -1, -1, -1, -1, -1, -1, -1};
+    private final android.util.SparseIntArray slotFingers = new android.util.SparseIntArray();
 
     /** reads what the game says every frame: when to show, the buttons' names, and the rumble */
     private final Runnable poll = new Runnable() {
@@ -224,7 +242,10 @@ public final class TouchControls extends View implements SensorEventListener, In
                 return;
             scene = nativeScene();
             updateShowing();
+            nativeTouchHudActive(showing && !hidden && !editing);
             readBindings();
+            nativeWeaponSlots(weaponSlots);
+            invalidate();
             updateRumble();
             postDelayed(this, POLL_MS);
         }
@@ -357,7 +378,7 @@ public final class TouchControls extends View implements SensorEventListener, In
     private boolean shown() {
         if ((scene & SCENE_KNOWN) == 0 || (scene & (SCENE_MENUS | SCENE_OFF)) != 0 || !touchscreen)
             return false;
-        return (scene & SCENE_ON) != 0 || !controllerConnected;
+        return !controllerConnected;
     }
 
     /** shows the controls once shown() has held for SHOW_DELAY_MS; hides them at once */
@@ -373,6 +394,7 @@ public final class TouchControls extends View implements SensorEventListener, In
         }
         if (show != showing) {
             showing = show;
+            nativeTouchHudActive(show && !hidden && !editing);
             reset();
             updateSensors();
         }
@@ -424,6 +446,7 @@ public final class TouchControls extends View implements SensorEventListener, In
     private void setHidden(boolean hidden) {
         reset();
         this.hidden = hidden;
+        nativeTouchHudActive(showing && !hidden && !editing);
         preferences.edit().putBoolean(KEY_HIDDEN, hidden).apply();
         updateSensors();
     }
@@ -437,7 +460,9 @@ public final class TouchControls extends View implements SensorEventListener, In
         owners.clear();
         buttonTouches.clear();
         toolbarFingers.clear();
+        slotFingers.clear();
         lookPointer = -1;
+        lookEventTime = -1;
         stickFloating = false;
         gyroAim.reset();
         nativeLookReset();
@@ -511,6 +536,16 @@ public final class TouchControls extends View implements SensorEventListener, In
         return (x - cx) * (x - cx) + (y - cy) * (y - cy) <= radius * radius;
     }
 
+    /** D-pad directions belong to controller navigation, not the mobile gameplay HUD. */
+    private boolean isGameplayDpad(int type) {
+        return type >= 12 && type <= 15;
+    }
+
+    private boolean isWeaponSwitchControl(int type) {
+        int button = KINDS[type].gamepadButton;
+        return button >= 0 && button < bindings.length && bindings[button] == 3;
+    }
+
     /** what is under a point (logical units): a toolbar item, a control, or NOTHING */
     private int hit(float x, float y) {
         if (inside(x, y, optionsX(), toolbarY(), toolbarRadius(OPTIONS_RADIUS)))
@@ -525,6 +560,8 @@ public final class TouchControls extends View implements SensorEventListener, In
             return NOTHING;
         for (int i = 0; i < layout.size(); i++) {
             if (layout.shown(i) && layout.type(i) != TouchLayout.LEFT
+                    && !isGameplayDpad(layout.type(i))
+                    && (editing || !isWeaponSwitchControl(layout.type(i)))
                     && inside(x, y, layout.x(i), layout.y(i), layout.radius(i)))
                 return i;
         }
@@ -575,6 +612,7 @@ public final class TouchControls extends View implements SensorEventListener, In
     }
 
     private void gameTouch(MotionEvent event) {
+        if (event.getActionMasked() == MotionEvent.ACTION_CANCEL) slotFingers.clear();
         int index = event.getActionIndex();
         int id = event.getPointerId(index);
         switch (event.getActionMasked()) {
@@ -584,7 +622,7 @@ public final class TouchControls extends View implements SensorEventListener, In
                 break;
             case MotionEvent.ACTION_MOVE:
                 for (int i = 0; i < event.getPointerCount(); i++)
-                    fingerMoved(event.getPointerId(i), event.getX(i), event.getY(i));
+                    fingerMoved(event.getPointerId(i), event.getX(i), event.getY(i), event.getEventTime());
                 break;
             case MotionEvent.ACTION_UP:
             case MotionEvent.ACTION_POINTER_UP:
@@ -599,11 +637,27 @@ public final class TouchControls extends View implements SensorEventListener, In
     }
 
     /** a finger down in a game, at a point in pixels */
+    private RectF weaponFrame(int slot) {
+        float w = 102f, h = 43f, gap = 4f;
+        float start = logicalWidth * 0.50f - w - gap / 2f;
+        float top = logicalHeight - h - 7f;
+        float left = start + slot * (w + gap);
+        return new RectF(left, top, left + w, top + h);
+    }
+
     private void fingerDown(int id, float px, float py) {
         if (inGestureZone(px, py, true))
             return;
         float x = logical(px);
         float y = logical(py);
+        if (!editing && !hidden) {
+            for (int slot = 0; slot < 2; slot++) {
+                if (weaponSlots[slot] >= 0 && weaponFrame(slot).contains(x, y)) {
+                    slotFingers.put(id, slot);
+                    return;
+                }
+            }
+        }
         int target = hit(x, y);
         int stick = TouchLayout.LEFT;
         if (target == NOTHING && layout.floatingStick && !hidden && layout.shown(stick) && !held(stick)
@@ -628,6 +682,7 @@ public final class TouchControls extends View implements SensorEventListener, In
         lookPointer = id;
         lookX = px;
         lookY = py;
+        lookEventTime = -1;
         if (owners.get(id, NOTHING) == NOTHING)
             owners.put(id, LOOK);
     }
@@ -636,7 +691,7 @@ public final class TouchControls extends View implements SensorEventListener, In
         return Math.hypot(px - origin[0], py - origin[1]) > SLOP * scale;
     }
 
-    private void fingerMoved(int id, float px, float py) {
+    private void fingerMoved(int id, float px, float py, long eventTime) {
         int control = owners.get(id, NOTHING);
         if (control >= 0 && layout.type(control) == TouchLayout.LEFT)
             moveStick(control, logical(px), logical(py));
@@ -658,15 +713,35 @@ public final class TouchControls extends View implements SensorEventListener, In
             lookPointer = id;
             lookX = origin[0];
             lookY = origin[1];
+            lookEventTime = -1;
         }
         if (id == lookPointer) {
-            nativeLook(logical(px - lookX) * sensitivity, logical(py - lookY) * sensitivity);
+            float dx = logical(px - lookX);
+            float dy = logical(py - lookY);
+            // Response depends on finger speed, not on holding a fixed direction.
+            // Every output remains proportional to the actual finger displacement:
+            // no target tracking, inertia, or turn rate when the finger stops.
+            long elapsed = lookEventTime < 0 ? 16 : Math.max(1, eventTime - lookEventTime);
+            float speed = (float) Math.hypot(dx, dy) * 1000f / elapsed;
+            float blend = Math.min(1f, speed / 900f);
+            float response = 0.78f + 0.67f * blend;
+            nativeLook(dx * sensitivity * response, dy * sensitivity * response);
             lookX = px;
             lookY = py;
+            lookEventTime = eventTime;
         }
     }
 
     private void fingerUp(int id, float px, float py) {
+        int slot = slotFingers.get(id, -1);
+        if (slot >= 0) {
+            slotFingers.delete(id);
+            if (weaponFrame(slot).contains(logical(px), logical(py)) && weaponSlots[slot] >= 0)
+                nativeSelectWeaponSlot(slot);
+            performClick();
+            return;
+        }
+
         float[] toolbar = toolbarFingers.get(id);
         if (toolbar != null) {
             toolbarFingers.remove(id);
@@ -681,8 +756,10 @@ public final class TouchControls extends View implements SensorEventListener, In
             axes[1] = 0;
             stickFloating = false;
         }
-        if (id == lookPointer)
+        if (id == lookPointer) {
             lookPointer = -1;
+            lookEventTime = -1;
+        }
         owners.delete(id);
         buttonTouches.remove(id);
     }
@@ -1201,6 +1278,232 @@ public final class TouchControls extends View implements SensorEventListener, In
         canvas.drawText(label, x, y + textSize * 0.36f, paint);
     }
 
+    private Bitmap getCrouchIconBitmap() {
+        if (crouchIconBitmap == null)
+            crouchIconBitmap = BitmapFactory.decodeResource(getResources(), R.drawable.crouch_spartan);
+        return crouchIconBitmap;
+    }
+
+    private Bitmap getJumpIconBitmap() {
+        if (jumpIconBitmap == null)
+            jumpIconBitmap = BitmapFactory.decodeResource(getResources(), R.drawable.jump_spartan);
+        return jumpIconBitmap;
+    }
+
+
+    private Bitmap getFireIconBitmap() {
+        if (fireIconBitmap == null) {
+            fireIconBitmap = BitmapFactory.decodeResource(getResources(), R.drawable.fire_projectile);
+        }
+        return fireIconBitmap;
+    }
+
+
+    private Bitmap getMeleeIconBitmap() {
+        if (meleeIconBitmap == null) {
+            meleeIconBitmap = BitmapFactory.decodeResource(getResources(), R.drawable.melee_energy_sword);
+        }
+        return meleeIconBitmap;
+    }
+
+    /** Original tactical HUD pictograms; only in gameplay, never in Halo's touch menus. */
+    private void tacticalButton(Canvas canvas, float x, float y, float radius, int type, boolean active, float opacity) {
+        int action = -1;
+        Kind kind = KINDS[type];
+        if (kind.gamepadButton >= 0 && kind.gamepadButton < bindings.length)
+            action = bindings[kind.gamepadButton];
+        if (action < 0 || action >= GAME_CONTROLS.length) {
+            circle(canvas, x, y, radius, kind.buttonName, active, 11, opacity);
+            return;
+        }
+        // A smoke-grey ring with white line-art, like a contemporary mobile shooter.
+        paint.setStyle(Paint.Style.FILL);
+        paint.setColor(alpha(active ? 0x9998bac8 : 0x66313c43, opacity));
+        canvas.drawCircle(x, y, radius, paint);
+        paint.setStyle(Paint.Style.STROKE);
+        paint.setStrokeWidth(1.6f);
+        paint.setColor(alpha(Color.WHITE, opacity * (active ? 0.90f : 0.52f)));
+        canvas.drawCircle(x, y, radius, paint);
+        canvas.save();
+        canvas.translate(x, y);
+        float s = radius / 42f;
+        canvas.scale(s, s);
+        paint.setStrokeWidth(2.6f);
+        paint.setStrokeCap(Paint.Cap.ROUND);
+        paint.setStrokeJoin(Paint.Join.ROUND);
+        paint.setColor(alpha(Color.WHITE, Math.max(0.55f, opacity)));
+        paint.setStyle(Paint.Style.STROKE);
+        Path path = new Path();
+        switch (action) {
+            case 7: { // FIRE: projectile icon provided by the user
+                Bitmap fire = getFireIconBitmap();
+                if (fire != null) {
+                    paint.setStyle(Paint.Style.FILL);
+                    paint.setColor(alpha(Color.WHITE, Math.max(0.55f, opacity)));
+                    float maxW = 28f;
+                    float maxH = 28f;
+                    float bw = fire.getWidth();
+                    float bh = fire.getHeight();
+                    float bitmapScale = Math.min(maxW / bw, maxH / bh);
+                    float dx = bw * bitmapScale * 0.5f;
+                    float dy = bh * bitmapScale * 0.5f;
+                    RectF dst = new RectF(-dx, -dy, dx, dy);
+                    canvas.drawBitmap(fire, null, dst, paint);
+                    paint.setColor(alpha(Color.WHITE, Math.max(0.55f, opacity)));
+                    paint.setStyle(Paint.Style.STROKE);
+                } else {
+                    line(canvas, -20, 3, 18, 3);
+                    line(canvas, -17, -4, 13, -4);
+                    line(canvas, -14, -4, -14, -9);
+                    line(canvas, 13, -4, 22, 0);
+                    line(canvas, 0, 4, -4, 15);
+                    line(canvas, -4, 15, 6, 15);
+                    line(canvas, -18, 5, -21, 12);
+                }
+                break;
+            }
+            case 11: // ADS / reticle
+                canvas.drawCircle(0, 0, 12, paint);
+                canvas.drawCircle(0, 0, 2.5f, paint);
+                line(canvas, -23, 0, -15, 0); line(canvas, 15, 0, 23, 0);
+                line(canvas, 0, -23, 0, -15); line(canvas, 0, 15, 0, 23);
+                break;
+            case 2: // RELOAD: cartridges surrounded by two circular arrows
+                paint.setStrokeWidth(3.0f);
+                canvas.drawArc(new RectF(-21, -21, 21, 21), 208, 140, false, paint);
+                canvas.drawArc(new RectF(-21, -21, 21, 21), 27, 140, false, paint);
+                path.moveTo(18, -17); path.lineTo(22, -5); path.lineTo(10, -9);
+                canvas.drawPath(path, paint);
+                path.reset();
+                path.moveTo(-18, 17); path.lineTo(-22, 5); path.lineTo(-10, 9);
+                canvas.drawPath(path, paint);
+                // Three unmistakable rounds, not a grenade.
+                paint.setStyle(Paint.Style.FILL);
+                for (int k = -1; k <= 1; k++) {
+                    float bx = k * 9f;
+                    canvas.drawRoundRect(new RectF(bx - 3, -10, bx + 3, 10), 1.2f, 1.2f, paint);
+                    path.reset();
+                    path.moveTo(bx - 3, -10);
+                    path.lineTo(bx, -15);
+                    path.lineTo(bx + 3, -10);
+                    path.close();
+                    canvas.drawPath(path, paint);
+                }
+                paint.setStyle(Paint.Style.STROKE);
+                break;
+            case 0: { // JUMP: exact jumping Spartan image provided by user
+                Bitmap jump = getJumpIconBitmap();
+                if (jump != null) {
+                    paint.setStyle(Paint.Style.FILL);
+                    paint.setColor(alpha(Color.WHITE, Math.max(0.55f, opacity)));
+                    float bw = jump.getWidth();
+                    float bh = jump.getHeight();
+                    float bitmapScale = Math.min(28f / bw, 28f / bh);
+                    float dx = bw * bitmapScale * 0.5f;
+                    float dy = bh * bitmapScale * 0.5f;
+                    canvas.drawBitmap(jump, null, new RectF(-dx, -dy, dx, dy), paint);
+                    paint.setStyle(Paint.Style.STROKE);
+                }
+                break;
+            }
+            case 10: { // CROUCH: use the exact kneeling Spartan icon provided by the user
+                Bitmap crouch = getCrouchIconBitmap();
+                if (crouch != null) {
+                    paint.setStyle(Paint.Style.FILL);
+                    paint.setColor(alpha(Color.WHITE, Math.max(0.55f, opacity)));
+                    float maxW = 28f;
+                    float maxH = 26f;
+                    float bw = crouch.getWidth();
+                    float bh = crouch.getHeight();
+                    float bitmapScale = Math.min(maxW / bw, maxH / bh);
+                    float dx = bw * bitmapScale * 0.5f;
+                    float dy = bh * bitmapScale * 0.5f;
+                    RectF dst = new RectF(-dx, -dy + 1.5f, dx, dy + 1.5f);
+                    canvas.drawBitmap(crouch, null, dst, paint);
+                    paint.setColor(alpha(Color.WHITE, Math.max(0.55f, opacity)));
+                    paint.setStyle(Paint.Style.STROKE);
+                } else {
+                    paint.setStyle(Paint.Style.FILL);
+                    canvas.drawCircle(2, -16, 5, paint);
+                    canvas.drawRoundRect(new RectF(-1, -21, 9, -17), 2, 2, paint);
+                    path.reset();
+                    path.moveTo(0, -10); path.lineTo(12, -5);
+                    path.lineTo(14, 5); path.lineTo(4, 8);
+                    path.lineTo(-5, 0); path.close();
+                    canvas.drawPath(path, paint);
+                    canvas.drawRoundRect(new RectF(-22, -10, 2, -7), 1, 1, paint);
+                    canvas.drawRect(-14, -13, -10, -10, paint);
+                    paint.setStyle(Paint.Style.STROKE);
+                    paint.setStrokeWidth(4f);
+                    line(canvas, 0, -6, -8, -8);
+                    line(canvas, 6, -4, -3, -8);
+                    line(canvas, 5, 5, -11, 8);
+                    line(canvas, -11, 8, -19, 15);
+                    line(canvas, 5, 5, 16, 11);
+                    line(canvas, 16, 11, 12, 18);
+                    paint.setStrokeWidth(2.6f);
+                }
+                break;
+            }
+            case 6: // GRENADE
+                canvas.drawOval(new RectF(-12, -12, 12, 20), paint);
+                canvas.drawRoundRect(new RectF(-5, -19, 6, -12), 2, 2, paint);
+                canvas.drawArc(new RectF(3, -23, 16, -11), 175, 175, false, paint);
+                line(canvas, -11, 0, 11, 0); line(canvas, 0, -10, 0, 18);
+                break;
+            case 3: // SWITCH WEAPON
+                line(canvas, -19, -9, 18, -9); line(canvas, 18, -9, 11, -15);
+                line(canvas, 18, -9, 11, -3);
+                line(canvas, 19, 9, -18, 9); line(canvas, -18, 9, -11, 3);
+                line(canvas, -18, 9, -11, 15);
+                break;
+            case 4: { // MELEE: energy-sword Spartan icon provided by the user
+                Bitmap melee = getMeleeIconBitmap();
+                if (melee != null) {
+                    paint.setStyle(Paint.Style.FILL);
+                    paint.setColor(alpha(Color.WHITE, Math.max(0.55f, opacity)));
+                    float maxW = 29f;
+                    float maxH = 29f;
+                    float bw = melee.getWidth();
+                    float bh = melee.getHeight();
+                    float bitmapScale = Math.min(maxW / bw, maxH / bh);
+                    float dx = bw * bitmapScale * 0.5f;
+                    float dy = bh * bitmapScale * 0.5f;
+                    RectF dst = new RectF(-dx, -dy, dx, dy);
+                    canvas.drawBitmap(melee, null, dst, paint);
+                    paint.setColor(alpha(Color.WHITE, Math.max(0.55f, opacity)));
+                    paint.setStyle(Paint.Style.STROKE);
+                } else {
+                    canvas.drawCircle(0, 0, 5, paint);
+                    for (int i = 0; i < 8; i++) {
+                        double a = Math.PI * 2 * i / 8;
+                        line(canvas, (float)Math.cos(a) * 10, (float)Math.sin(a) * 10,
+                            (float)Math.cos(a) * 21, (float)Math.sin(a) * 21);
+                    }
+                }
+                break;
+            }
+            case 5: // FLASHLIGHT
+                canvas.drawRect(-18, -7, -4, 8, paint);
+                line(canvas, -4, -5, 19, -18); line(canvas, -4, 6, 19, 19);
+                line(canvas, 19, -18, 19, 19);
+                break;
+            case 1: // GRENADE TYPE
+                canvas.drawCircle(-7, 4, 9, paint); canvas.drawCircle(10, -3, 8, paint);
+                canvas.drawArc(new RectF(-22, -22, 22, 22), 200, 135, false, paint);
+                break;
+            default: // Leave uncommon inputs (menu/system actions) recognizable.
+                canvas.restore();
+                circle(canvas, x, y, radius, label(type), active, 11, opacity);
+                return;
+        }
+        canvas.restore();
+    }
+
+    private void line(Canvas canvas, float x1, float y1, float x2, float y2) {
+        canvas.drawLine(x1, y1, x2, y2, paint);
+    }
+
     /** a toolbar item: never fainter than half, so that it can always be found */
     private void toolbarItem(Canvas canvas, float x, float radius, String label) {
         circle(canvas, x, toolbarY(), toolbarRadius(radius), label, false, 11, Math.max(layout.opacity, 0.5f));
@@ -1232,6 +1535,58 @@ public final class TouchControls extends View implements SensorEventListener, In
             Math.max(STICK_KNOB_RADIUS * size, radius * 0.375f), "", held(stick), 11, layout.opacity);
     }
 
+    /** White, compact gun silhouettes drawn from the engine's weapon IDs. */
+    private void drawWeaponSilhouette(Canvas canvas, int type, float x, float y) {
+        paint.setColor(alpha(Color.WHITE, layout.opacity));
+        paint.setStrokeWidth(2.3f);
+        paint.setStrokeCap(Paint.Cap.ROUND);
+        paint.setStyle(Paint.Style.STROKE);
+        float length = (type == 2 || type == 3) ? 31f : (type == 8 ? 67f : 54f);
+        float left = x - length / 2f;
+        canvas.drawLine(left, y, left + length, y, paint);
+        canvas.drawLine(left + 5f, y - 6f, left + length - 8f, y - 6f, paint);
+        canvas.drawLine(left + 11f, y, left + 8f, y + 12f, paint);
+        canvas.drawLine(left + 8f, y + 12f, left + 19f, y + 12f, paint);
+        canvas.drawLine(left + length - 11f, y, left + length - 9f, y + 5f, paint);
+        if (type == 7) { // sniper optic
+            canvas.drawRect(left + 22f, y - 12f, left + 36f, y - 8f, paint);
+        } else if (type == 8) { // launcher tube
+            canvas.drawRect(left, y - 6f, left + length, y + 1f, paint);
+        } else if (type == 5) { // needler spikes
+            for (int k = 0; k < 4; k++)
+                canvas.drawLine(left + 20f + 7f*k, y - 6f, left + 18f + 7f*k, y - 13f, paint);
+        }
+        paint.setStyle(Paint.Style.FILL);
+    }
+
+    /** Gameplay only; original Halo ammo, shields and radar remain untouched. */
+    private void drawWeaponSlotFrames(Canvas canvas) {
+        if (hidden || editing) return;
+        for (int slot = 0; slot < 2; slot++) {
+            RectF frame = weaponFrame(slot);
+            boolean active = weaponSlots[2] == slot;
+            boolean equipped = weaponSlots[slot] >= 0;
+            paint.setStyle(Paint.Style.FILL);
+            paint.setColor(alpha(0x26202930, layout.opacity));
+            canvas.drawRoundRect(frame, 2f, 2f, paint);
+            paint.setStyle(Paint.Style.STROKE);
+            paint.setStrokeWidth(active ? 2.0f : 1.1f);
+            paint.setColor(alpha(active ? 0xFFFFD64B : 0xFFCAD1D4, layout.opacity));
+            canvas.drawRoundRect(frame, 2f, 2f, paint);
+            paint.setStyle(Paint.Style.FILL);
+            if (equipped) {
+                // Original Halo messaging icon is drawn by the native HUD underneath.
+                paint.setColor(alpha(Color.WHITE, layout.opacity));
+            } else {
+                paint.setColor(alpha(0xFF8E9CA3, layout.opacity));
+            }
+            paint.setTextAlign(Paint.Align.LEFT);
+            paint.setTextSize(10f);
+            canvas.drawText("0" + (slot + 1), frame.left + 6f, frame.top + 12f, paint);
+        }
+        paint.setStyle(Paint.Style.FILL);
+    }
+
     @Override
     protected void onDraw(Canvas canvas) {
         if (!showing && !editing)
@@ -1242,13 +1597,15 @@ public final class TouchControls extends View implements SensorEventListener, In
             if (layout.shown(TouchLayout.LEFT))
                 drawStick(canvas);
             for (int i = 0; i < layout.size(); i++) {
-                if (!layout.shown(i) || layout.type(i) == TouchLayout.LEFT)
+                if (!layout.shown(i) || layout.type(i) == TouchLayout.LEFT
+                        || isGameplayDpad(layout.type(i))
+                        || (!editing && isWeaponSwitchControl(layout.type(i))))
                     continue;
-                float textSize = 11 * Math.max(layout.sizeScale(i), layout.radius(i) / 36f);
-                circle(canvas, layout.x(i), layout.y(i), layout.radius(i), label(layout.type(i)),
-                    held(i) || dragControl == i, Math.min(textSize, 16), layout.opacity);
+                tacticalButton(canvas, layout.x(i), layout.y(i), layout.radius(i), layout.type(i),
+                    held(i) || dragControl == i, layout.opacity);
             }
         }
+        drawWeaponSlotFrames(canvas);
         drawToolbar(canvas);
         canvas.restore();
     }
