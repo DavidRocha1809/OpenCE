@@ -286,3 +286,60 @@ int host_touch_hud_active(void)
 {
     return touch_hud_active;
 }
+
+/* A campaign launch waits asynchronously in the menu until Java accepts a
+ * layout. Both threads keep running; no render/input lock waits on a dialog. */
+static int layout_available;
+static int layout_request; /* 0: idle, 1: waiting for choice, 2: accepted */
+
+int host_touch_layout_request(void)
+{
+    int available;
+    pthread_mutex_lock(&touch_lock);
+    available = layout_available;
+    if (available && !layout_request) layout_request = 1;
+    pthread_mutex_unlock(&touch_lock);
+    return available;
+}
+
+int host_touch_layout_take_choice(void)
+{
+    int chosen;
+    pthread_mutex_lock(&touch_lock);
+    chosen = layout_request == 2;
+    if (chosen) layout_request = 0;
+    pthread_mutex_unlock(&touch_lock);
+    return chosen;
+}
+
+JNIEXPORT void JNICALL Java_com_halo_decomp_TouchControls_nativeLayoutAvailable(
+    JNIEnv *env, jclass cls, jboolean available)
+{
+    (void)env;
+    (void)cls;
+    pthread_mutex_lock(&touch_lock);
+    layout_available = available;
+    pthread_mutex_unlock(&touch_lock);
+}
+
+JNIEXPORT jboolean JNICALL Java_com_halo_decomp_TouchControls_nativeLayoutRequested(
+    JNIEnv *env, jclass cls)
+{
+    int requested;
+    (void)env;
+    (void)cls;
+    pthread_mutex_lock(&touch_lock);
+    requested = layout_request == 1;
+    pthread_mutex_unlock(&touch_lock);
+    return requested;
+}
+
+JNIEXPORT void JNICALL Java_com_halo_decomp_TouchControls_nativeLayoutChosen(
+    JNIEnv *env, jclass cls)
+{
+    (void)env;
+    (void)cls;
+    pthread_mutex_lock(&touch_lock);
+    if (layout_request == 1) layout_request = 2;
+    pthread_mutex_unlock(&touch_lock);
+}

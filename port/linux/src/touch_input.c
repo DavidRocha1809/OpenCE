@@ -36,6 +36,9 @@ void host_touch_bindings(const int *controls);
 int touch_game_cinematic_skippable(void);
 int touch_game_cinematic_playing(void);
 int touch_game_playing(void);
+#ifdef HALO_ANDROID
+void menu_functions_touch_layout_update(void);
+#endif
 void touch_game_button_controls(int *controls);
 #ifdef HALO_ANDROID
 void touch_game_weapon_slots(int slots[9], int requested);
@@ -292,6 +295,9 @@ void touch_input_controls(XINPUT_GAMEPAD *pad, int menus)
 	int state[7];
 	int index;
 
+#ifdef HALO_ANDROID
+	menu_functions_touch_layout_update();
+#endif
 	/* (the controls show only in a game: not while it starts, at the main
 	menu, in a menu or during a cinematic; nor while the text chat's
 	on-screen keyboard is up, whose keys the fingers then tap) */

@@ -46,6 +46,11 @@ final class TouchLayout {
      * Order: A, B, X, Y, RT, LT, LS, RS, White, Black, Start, Back,
      * D-pad up/down/left/right, movement stick, left fire.
      */
+    private static final float[][] CLASSIC_DEFAULTS = {
+        {856, 447}, {913, 377}, {794, 377}, {850, 312}, {915, 239}, {802, 239},
+        {236, 449}, {691, 449}, {360, 490}, {438, 490}, {570, 36}, {390, 36},
+        {100, 237}, {100, 335}, {51, 286}, {149, 286}, {115, 440}, {255, 239}
+    };
     private static final float[][] DEFAULTS = {
         {887, 470}, {905, 359}, {300, 486}, {824, 304}, {787, 371}, {782, 225},
         {792, 489}, {878, 243}, {599, 495}, {659, 494}, {570, 36}, {390, 36},
@@ -180,6 +185,14 @@ final class TouchLayout {
     }
 
     /** the default controls, at their default places, sizes and visibility */
+    void resetClassicDefaults() {
+        controls.clear();
+        for (int i = 0; i < CLASSIC_DEFAULTS.length; i++)
+            controls.add(new Control(i, CLASSIC_DEFAULTS[i][0] * width / GRID_WIDTH,
+                CLASSIC_DEFAULTS[i][1] * height / GRID_HEIGHT));
+        keepAllInside();
+    }
+
     void resetDefaults() {
         controls.clear();
         for (int i = 0; i < DEFAULTS.length; i++) {

@@ -11,6 +11,8 @@ import android.graphics.Color;
 import android.graphics.Paint;
 import android.graphics.Path;
 import android.graphics.RectF;
+import android.graphics.drawable.GradientDrawable;
+import android.graphics.drawable.StateListDrawable;
 import android.hardware.Sensor;
 import android.hardware.SensorEvent;
 import android.hardware.SensorEventListener;
@@ -99,8 +101,12 @@ public final class TouchControls extends View implements SensorEventListener, In
     private static final int SCENE_ON = 4;
     private static final int SCENE_OFF = 8;
 
+
     private static final String PREFERENCES = "touch-layout-v1";
     private static final String KEY_CONFIGURATION = "configuration";
+    private static final String KEY_MODERN = "modern-ui";
+    private static final String KEY_CLASSIC_CONFIGURATION = "classic-configuration";
+    private boolean modernUi;
     private static final String KEY_HIDDEN = "hidden";
 
     /**
@@ -163,6 +169,9 @@ public final class TouchControls extends View implements SensorEventListener, In
     private static native int nativeRumble();
     private static native void nativeTouchHudActive(boolean active);
     private static native int nativeScene();
+    private static native void nativeLayoutAvailable(boolean available);
+    private static native boolean nativeLayoutRequested();
+    private static native void nativeLayoutChosen();
     private static native void nativeWeaponSlots(int[] state);
     private static native void nativeSelectWeaponSlot(int slot);
     private static native int nativeBindings(int[] controls);
@@ -242,9 +251,12 @@ public final class TouchControls extends View implements SensorEventListener, In
                 return;
             scene = nativeScene();
             updateShowing();
-            nativeTouchHudActive(showing && !hidden && !editing);
+            nativeTouchHudActive(modernUi && showing && !hidden && !editing);
             readBindings();
             nativeWeaponSlots(weaponSlots);
+            nativeLayoutAvailable(touchscreen && !controllerConnected && (scene & SCENE_OFF) == 0);
+            if (nativeLayoutRequested() && openDialogs == 0)
+                showInterface(true);
             invalidate();
             updateRumble();
             postDelayed(this, POLL_MS);
@@ -264,6 +276,7 @@ public final class TouchControls extends View implements SensorEventListener, In
         inputManager = (InputManager) context.getSystemService(Context.INPUT_SERVICE);
         touchscreenFeature = context.getPackageManager().hasSystemFeature(PackageManager.FEATURE_TOUCHSCREEN);
         preferences = context.getSharedPreferences(PREFERENCES, Context.MODE_PRIVATE);
+        modernUi = preferences.getBoolean(KEY_MODERN, preferences.contains(KEY_CONFIGURATION));
         loadLayout(context);
         hidden = preferences.getBoolean(KEY_HIDDEN, false);
         refreshInputDevices();
@@ -285,8 +298,15 @@ public final class TouchControls extends View implements SensorEventListener, In
         });
     }
 
+    private String configurationKey() {
+        return modernUi ? KEY_CONFIGURATION : KEY_CLASSIC_CONFIGURATION;
+    }
+
     private void loadLayout(Context context) {
-        String configuration = preferences.getString(KEY_CONFIGURATION, null);
+        layout = new TouchLayout();
+        if (!modernUi) layout.resetClassicDefaults();
+        sensitivity = 1f;
+        String configuration = preferences.getString(configurationKey(), null);
         if (configuration == null)
             return;
         try {
@@ -394,7 +414,7 @@ public final class TouchControls extends View implements SensorEventListener, In
         }
         if (show != showing) {
             showing = show;
-            nativeTouchHudActive(show && !hidden && !editing);
+            nativeTouchHudActive(modernUi && show && !hidden && !editing);
             reset();
             updateSensors();
         }
@@ -446,7 +466,7 @@ public final class TouchControls extends View implements SensorEventListener, In
     private void setHidden(boolean hidden) {
         reset();
         this.hidden = hidden;
-        nativeTouchHudActive(showing && !hidden && !editing);
+        nativeTouchHudActive(modernUi && showing && !hidden && !editing);
         preferences.edit().putBoolean(KEY_HIDDEN, hidden).apply();
         updateSensors();
     }
@@ -560,8 +580,8 @@ public final class TouchControls extends View implements SensorEventListener, In
             return NOTHING;
         for (int i = 0; i < layout.size(); i++) {
             if (layout.shown(i) && layout.type(i) != TouchLayout.LEFT
-                    && !isGameplayDpad(layout.type(i))
-                    && (editing || !isWeaponSwitchControl(layout.type(i)))
+                    && (!modernUi || !isGameplayDpad(layout.type(i)))
+                    && (!modernUi || editing || !isWeaponSwitchControl(layout.type(i)))
                     && inside(x, y, layout.x(i), layout.y(i), layout.radius(i)))
                 return i;
         }
@@ -650,7 +670,7 @@ public final class TouchControls extends View implements SensorEventListener, In
             return;
         float x = logical(px);
         float y = logical(py);
-        if (!editing && !hidden) {
+        if (modernUi && !editing && !hidden) {
             for (int slot = 0; slot < 2; slot++) {
                 if (weaponSlots[slot] >= 0 && weaponFrame(slot).contains(x, y)) {
                     slotFingers.put(id, slot);
@@ -842,7 +862,7 @@ public final class TouchControls extends View implements SensorEventListener, In
     // ---------- the layout, saved and in files
 
     private boolean saveLayout() {
-        boolean saved = preferences.edit().putString(KEY_CONFIGURATION, exportLayout()).commit();
+        boolean saved = preferences.edit().putString(configurationKey(), exportLayout()).commit();
         if (!saved)
             Toast.makeText(getContext(), "The touch layout could not be saved. Try again.", Toast.LENGTH_LONG).show();
         return saved;
@@ -858,7 +878,7 @@ public final class TouchControls extends View implements SensorEventListener, In
         imported.layout.bounds(logicalWidth, logicalHeight);
         imported.layout.setMinimumRadius(minimumRadius());
         String normalized = imported.layout.exportConfiguration(imported.sensitivity);
-        if (!preferences.edit().putString(KEY_CONFIGURATION, normalized).commit())
+        if (!preferences.edit().putString(configurationKey(), normalized).commit())
             throw new IllegalArgumentException("Could not save the imported layout");
         reset();
         layout = imported.layout;
@@ -887,7 +907,8 @@ public final class TouchControls extends View implements SensorEventListener, In
     }
 
     private void showOptions() {
-        String[] items = {"General", "Edit buttons layout", "Look sensitivity"};
+        String[] items = {"General", "Edit buttons layout", "Look sensitivity",
+            "Touch interface: " + (modernUi ? "Modern" : "Classic")};
         AlertDialog dialog = new AlertDialog.Builder(getContext())
             .setTitle("Options")
             .setItems(items, (d, which) -> {
@@ -896,13 +917,188 @@ public final class TouchControls extends View implements SensorEventListener, In
                 } else if (which == 1) {
                     editing = true;
                     setHidden(false);
-                } else {
+                } else if (which == 2) {
                     post(this::showSensitivity);
+                } else {
+                    post(this::showInterface);
                 }
             })
             .setNegativeButton("Close", null)
             .create();
         openDialog(dialog);
+    }
+
+    private boolean selectInterface(boolean modern) {
+        if (modern == modernUi) return true;
+        if (!saveLayout()) return false;
+        if (!preferences.edit().putBoolean(KEY_MODERN, modern).commit()) {
+            Toast.makeText(getContext(), "The interface could not be saved.", Toast.LENGTH_LONG).show();
+            return false;
+        }
+        reset();
+        modernUi = modern;
+        loadLayout(getContext());
+        layout.bounds(logicalWidth, logicalHeight);
+        layout.setMinimumRadius(minimumRadius());
+        nativeTouchHudActive(modernUi && showing && !hidden && !editing);
+        cancelRumble();
+        updateSensors();
+        invalidate();
+        return true;
+    }
+
+    /** Draw the saved buttons themselves, so previews follow layout edits and bindings. */
+    private final class InterfacePreview extends View {
+        private final boolean modern;
+        private final TouchLayout preview;
+        private final float previewWidth;
+        private final float previewHeight;
+
+        InterfacePreview(boolean modern) {
+            super(TouchControls.this.getContext());
+            this.modern = modern;
+            TouchLayout candidate = new TouchLayout();
+            if (!modern) candidate.resetClassicDefaults();
+            String saved = modern == modernUi ? exportLayout() : preferences.getString(
+                modern ? KEY_CONFIGURATION : KEY_CLASSIC_CONFIGURATION, null);
+            if (saved != null) {
+                try {
+                    candidate = TouchLayout.importConfiguration(saved).layout;
+                } catch (IllegalArgumentException ignored) {
+                    // The same default layout is used when switching to an unreadable save.
+                }
+            }
+            preview = candidate;
+            previewWidth = logicalWidth > 0 ? logicalWidth : GRID_WIDTH;
+            previewHeight = logicalHeight > 0 ? logicalHeight : GRID_HEIGHT;
+            preview.bounds(previewWidth, previewHeight);
+            preview.setMinimumRadius(minimumRadius());
+            setContentDescription(modern ? "Modern touch button layout preview" : "Classic touch button layout preview");
+        }
+
+        @Override
+        protected void onMeasure(int widthSpec, int heightSpec) {
+            int width = MeasureSpec.getSize(widthSpec);
+            setMeasuredDimension(width, resolveSize(Math.round(width * previewHeight / previewWidth), heightSpec));
+        }
+
+        @Override
+        protected void onDraw(Canvas canvas) {
+            Paint previous = new Paint(paint);
+            canvas.save();
+            canvas.drawColor(0xff050d1c);
+            canvas.scale(getWidth() / previewWidth, getHeight() / previewHeight);
+            paint.setStyle(Paint.Style.STROKE);
+            paint.setStrokeWidth(2);
+            paint.setColor(0xff2896ff);
+            canvas.drawCircle(previewWidth / 2, previewHeight / 2, 7, paint);
+            for (int i = 0; i < preview.size(); i++) {
+                int type = preview.type(i);
+                if (!preview.shown(i) || (modern && (isGameplayDpad(type) || isWeaponSwitchControl(type))))
+                    continue;
+                float x = preview.x(i), y = preview.y(i), radius = preview.radius(i);
+                if (type == TouchLayout.LEFT) {
+                    circle(canvas, x, y, radius, "", false, 11, 1);
+                    circle(canvas, x, y, radius * 0.4f, "", false, 11, 1);
+                } else if (modern) {
+                    tacticalButton(canvas, x, y, radius, type, false, 1);
+                } else {
+                    circle(canvas, x, y, radius, label(type), false,
+                        Math.min(11 * Math.max(preview.sizeScale(i), radius / 36f), 16), 1);
+                }
+            }
+            if (modern) {
+                for (int slot = 0; slot < 2; slot++) {
+                    float left = previewWidth * 0.5f - 104 + slot * 106;
+                    paint.setStyle(Paint.Style.STROKE);
+                    paint.setStrokeWidth(2);
+                    paint.setColor(slot == 0 ? 0xffffd64b : 0xffcad1d4);
+                    canvas.drawRect(left, previewHeight - 50, left + 102, previewHeight - 7, paint);
+                    paint.setStyle(Paint.Style.FILL);
+                    paint.setTextSize(14);
+                    paint.setTextAlign(Paint.Align.CENTER);
+                    canvas.drawText("0" + (slot + 1), left + 51, previewHeight - 23, paint);
+                }
+            }
+            canvas.restore();
+            paint.set(previous);
+        }
+    }
+
+    private GradientDrawable haloPanel(boolean highlighted) {
+        // Same panel gradient and text blue as tools/port_settings.py.
+        GradientDrawable background = new GradientDrawable(GradientDrawable.Orientation.TOP_BOTTOM,
+            new int[] {highlighted ? 0xff164777 : 0xff0a2649, 0xff050d1c});
+        background.setStroke(Math.max(1, Math.round(getResources().getDisplayMetrics().density)),
+            highlighted ? 0xffb9e4ff : 0xff2896ff);
+        return background;
+    }
+
+    private TextView haloText(String value, int size) {
+        TextView view = text(value);
+        view.setTextColor(0xff2896ff);
+        view.setTextSize(size);
+        return view;
+    }
+
+    private Button haloButton(String label, View.OnClickListener listener) {
+        Button view = button(label, listener);
+        view.setTextColor(Color.WHITE);
+        view.setBackgroundTintList(null);
+        StateListDrawable background = new StateListDrawable();
+        background.addState(new int[] {android.R.attr.state_pressed}, haloPanel(true));
+        background.addState(new int[] {android.R.attr.state_focused}, haloPanel(true));
+        background.addState(new int[] {}, haloPanel(false));
+        view.setBackground(background);
+        return view;
+    }
+
+    private void showInterface() {
+        showInterface(false);
+    }
+
+    private void showInterface(boolean beforeGame) {
+        LinearLayout panel = new LinearLayout(getContext());
+        panel.setOrientation(LinearLayout.VERTICAL);
+        int padding = Math.round(12 * getResources().getDisplayMetrics().density);
+        panel.setPadding(padding, padding, padding, padding);
+        panel.setBackground(haloPanel(false));
+        panel.addView(haloText("CHOOSE YOUR TOUCH LAYOUT", 22));
+        panel.addView(haloText(beforeGame
+            ? "Choose your touch controls to start the game."
+            : "Choose your touch controls. You can change them later in Options.", 14));
+        LinearLayout choices = new LinearLayout(getContext());
+        choices.setOrientation(LinearLayout.HORIZONTAL);
+        panel.addView(choices);
+        ScrollView scroll = new ScrollView(getContext());
+        scroll.addView(panel);
+        AlertDialog dialog = new AlertDialog.Builder(getContext())
+            .setView(scroll)
+            .setCancelable(!beforeGame)
+            .create();
+        for (int index = 0; index < 2; index++) {
+            final boolean modern = index == 1;
+            LinearLayout card = new LinearLayout(getContext());
+            card.setOrientation(LinearLayout.VERTICAL);
+            card.setPadding(padding / 2, padding / 2, padding / 2, padding / 2);
+            choices.addView(card, new LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1));
+            TextView title = haloText(modern ? "MODERN" : "CLASSIC", 20);
+            title.setTextSize(20);
+            card.addView(title);
+            card.addView(new InterfacePreview(modern), new LinearLayout.LayoutParams(
+                LinearLayout.LayoutParams.MATCH_PARENT, LinearLayout.LayoutParams.WRAP_CONTENT));
+            card.addView(haloText(modern ? "Action icons and two weapon slots." : "A, B, X, Y and weapon cycling.", 14));
+            card.addView(haloButton(modern ? "Use Modern" : "Use Classic", view -> {
+                if (selectInterface(modern)) {
+                    dialog.dismiss();
+                    if (beforeGame) nativeLayoutChosen();
+                }
+            }));
+        }
+        openDialog(dialog);
+        dialog.getWindow().setBackgroundDrawableResource(android.R.color.transparent);
+        dialog.getWindow().setLayout(Math.round(getResources().getDisplayMetrics().widthPixels * 0.94f),
+            WindowManager.LayoutParams.WRAP_CONTENT);
     }
 
     private TextView text(String value) {
@@ -1114,7 +1310,8 @@ public final class TouchControls extends View implements SensorEventListener, In
             .setNegativeButton("Cancel", null)
             .setPositiveButton("Reset", (d, which) -> {
                 reset();
-                layout.resetDefaults();
+                if (modernUi) layout.resetDefaults();
+                else layout.resetClassicDefaults();
                 setHidden(false);
                 saveLayout();
                 refresh.run();
@@ -1561,7 +1758,7 @@ public final class TouchControls extends View implements SensorEventListener, In
 
     /** Gameplay only; original Halo ammo, shields and radar remain untouched. */
     private void drawWeaponSlotFrames(Canvas canvas) {
-        if (hidden || editing) return;
+        if (!modernUi || hidden || editing) return;
         for (int slot = 0; slot < 2; slot++) {
             RectF frame = weaponFrame(slot);
             boolean active = weaponSlots[2] == slot;
@@ -1598,10 +1795,14 @@ public final class TouchControls extends View implements SensorEventListener, In
                 drawStick(canvas);
             for (int i = 0; i < layout.size(); i++) {
                 if (!layout.shown(i) || layout.type(i) == TouchLayout.LEFT
-                        || isGameplayDpad(layout.type(i))
-                        || (!editing && isWeaponSwitchControl(layout.type(i))))
+                        || (modernUi && isGameplayDpad(layout.type(i)))
+                        || (modernUi && !editing && isWeaponSwitchControl(layout.type(i))))
                     continue;
-                tacticalButton(canvas, layout.x(i), layout.y(i), layout.radius(i), layout.type(i),
+                if (!modernUi) {
+                    float textSize = 11 * Math.max(layout.sizeScale(i), layout.radius(i) / 36f);
+                    circle(canvas, layout.x(i), layout.y(i), layout.radius(i), label(layout.type(i)),
+                        held(i) || dragControl == i, Math.min(textSize, 16), layout.opacity);
+                } else tacticalButton(canvas, layout.x(i), layout.y(i), layout.radius(i), layout.type(i),
                     held(i) || dragControl == i, layout.opacity);
             }
         }
