@@ -41,7 +41,7 @@ void menu_functions_touch_layout_update(void);
 #endif
 void touch_game_button_controls(int *controls);
 #ifdef HALO_ANDROID
-void touch_game_weapon_slots(int slots[9], int requested);
+void touch_game_weapon_slots(int slots[16], int requested);
 #endif
 
 /* the gamepad's buttons (input.h), which the touch controls are named by */
@@ -314,7 +314,7 @@ void touch_input_controls(XINPUT_GAMEPAD *pad, int menus)
 	}
 #ifdef HALO_ANDROID
     {
-        int slots[9];
+        int slots[16];
         touch_game_weapon_slots(slots, host_touch_weapon_request());
         host_touch_weapon_slots(slots);
     }

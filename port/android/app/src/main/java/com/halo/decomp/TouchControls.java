@@ -173,6 +173,8 @@ public final class TouchControls extends View implements SensorEventListener, In
     private static native boolean nativeLayoutRequested();
     private static native void nativeLayoutChosen();
     private static native void nativeWeaponSlots(int[] state);
+    private static native void nativeWeaponDrawerExpanded(boolean expanded);
+    private static native void nativeWeaponDisplayOrder(int[] order);
     private static native void nativeSelectWeaponSlot(int slot);
     private static native int nativeBindings(int[] controls);
 
@@ -238,10 +240,19 @@ public final class TouchControls extends View implements SensorEventListener, In
     private final int[] bindings = DEFAULT_BINDINGS.clone();
     private final int[] bindingsRead = new int[bindings.length];
     private int bindingsSerial;
-    // [0..1] weapon kind, [2] active slot; [3..4] Halo HUD sprite sequence,
-    // [5..6] packed icon colors, [7..8] icon flags. Filled by the native engine.
-    private final int[] weaponSlots = {-1, -1, -1, -1, -1, -1, -1, -1, -1};
+    // [0..9] retain the existing two-weapon protocol and extra-slot occupancy.
+    // [10..11] original Halo messaging sprite sequence for slots 3 and 4,
+    // [12..13] original icon colors, [14..15] original icon flags.
+    // The engine draws those sprites; Java never substitutes placeholder art.
+    private final int[] weaponSlots = {-1, -1, -1, -1, -1, -1, -1, -1,
+        -1, 0, -1, -1, -1, -1, -1, -1};
+    private static final int WEAPON_DRAWER_TOGGLE = -2;
     private final android.util.SparseIntArray slotFingers = new android.util.SparseIntArray();
+    private final android.util.SparseArray<float[]> slotPositions = new android.util.SparseArray<>();
+    /** Visible frame index -> actual engine inventory index. Reorders the UI only. */
+    private final int[] weaponViewOrder = {0, 1, 2, 3};
+    private int lastWeaponOccupancy = -1;
+    private boolean weaponDrawerExpanded;
 
     /** reads what the game says every frame: when to show, the buttons' names, and the rumble */
     private final Runnable poll = new Runnable() {
@@ -254,6 +265,22 @@ public final class TouchControls extends View implements SensorEventListener, In
             nativeTouchHudActive(modernUi && showing && !hidden && !editing);
             readBindings();
             nativeWeaponSlots(weaponSlots);
+            // Keep the two quick slots populated by REAL weapons. On pickup
+            // or drop, promote remaining weapons from the drawer automatically.
+            int occupied = physicalWeaponMask();
+            if ((scene & SCENE_OFF) != 0 || occupied == 0) {
+                if (lastWeaponOccupancy != 0) resetWeaponViewOrder();
+                lastWeaponOccupancy = 0;
+            } else if (lastWeaponOccupancy != occupied) {
+                if (lastWeaponOccupancy <= 0) resetWeaponViewOrder();
+                WeaponSlotOrder.compact(weaponViewOrder, occupied);
+                lastWeaponOccupancy = occupied;
+            }
+            if (!hasExtraWeapons())
+                weaponDrawerExpanded = false;
+            nativeWeaponDisplayOrder(weaponViewOrder);
+            nativeWeaponDrawerExpanded(modernUi && showing && !hidden && !editing
+                && weaponDrawerExpanded && hasExtraWeapons());
             nativeLayoutAvailable(touchscreen && !controllerConnected && (scene & SCENE_OFF) == 0);
             if (nativeLayoutRequested() && openDialogs == 0)
                 showInterface(true);
@@ -481,6 +508,9 @@ public final class TouchControls extends View implements SensorEventListener, In
         buttonTouches.clear();
         toolbarFingers.clear();
         slotFingers.clear();
+        slotPositions.clear();
+        weaponDrawerExpanded = false;
+        nativeWeaponDrawerExpanded(false);
         lookPointer = -1;
         lookEventTime = -1;
         stickFloating = false;
@@ -661,8 +691,67 @@ public final class TouchControls extends View implements SensorEventListener, In
         float w = 102f, h = 43f, gap = 4f;
         float start = logicalWidth * 0.50f - w - gap / 2f;
         float top = logicalHeight - h - 7f;
-        float left = start + slot * (w + gap);
+        // The expanded drawer sits immediately above the original two frames.
+        if (slot >= 2) top -= h + 6f;
+        float left = start + (slot % 2) * (w + gap);
         return new RectF(left, top, left + w, top + h);
+    }
+
+    /** The drawer exists only when the engine really has weapon slot 3 or 4. */
+    private boolean hasExtraWeapons() {
+        return (weaponSlots[9] & 3) != 0;
+    }
+
+    /** Halo is currently showing a pickup/swap prompt for a weapon. */
+    private boolean hasWeaponPickupPrompt() {
+        return (weaponSlots[9] & (1 << 8)) != 0;
+    }
+
+    private int physicalWeaponMask() {
+        int mask = 0;
+        if (weaponSlots[0] >= 0) mask |= 1;
+        if (weaponSlots[1] >= 0) mask |= 2;
+        if ((weaponSlots[9] & 1) != 0) mask |= 4;
+        if ((weaponSlots[9] & 2) != 0) mask |= 8;
+        return mask;
+    }
+
+    private boolean hasWeaponAtFrame(int frame) {
+        return (physicalWeaponMask() & (1 << weaponViewOrder[frame])) != 0;
+    }
+
+    private void resetWeaponViewOrder() {
+        for (int i = 0; i < 4; i++) weaponViewOrder[i] = i;
+    }
+
+    private int frameAt(float x, float y) {
+        int count = weaponDrawerExpanded && hasExtraWeapons() ? 4 : 2;
+        for (int i = 0; i < count; i++)
+            if (weaponFrame(i).contains(x, y)) return i;
+        return -1;
+    }
+
+    private void moveWeaponBetweenFrames(int source, int destination) {
+        // Only promote a weapon FROM the drawer into one of the two quick
+        // frames. The displaced quick weapon automatically becomes inventory.
+        // The engine inventory itself stays untouched; weaponViewOrder tells
+        // the native selection gate which two physical slots are currently
+        // the quick pair.
+        if (source < 2 || destination < 0 || destination >= 2) return;
+        boolean selectMovedWeapon =
+            weaponSlots[2] == weaponViewOrder[destination];
+        int moved = WeaponSlotOrder.move(weaponViewOrder, physicalWeaponMask(),
+            source, destination);
+        if (moved < 0) return;
+        nativeWeaponDisplayOrder(weaponViewOrder);
+        if (selectMovedWeapon) nativeSelectWeaponSlot(moved);
+    }
+
+    private RectF weaponDrawerArrowFrame() {
+        RectF primary = weaponFrame(0);
+        float right = primary.left - 5f;
+        float cy = primary.centerY();
+        return new RectF(right - 32f, cy - 17f, right, cy + 17f);
     }
 
     private void fingerDown(int id, float px, float py) {
@@ -671,11 +760,17 @@ public final class TouchControls extends View implements SensorEventListener, In
         float x = logical(px);
         float y = logical(py);
         if (modernUi && !editing && !hidden) {
-            for (int slot = 0; slot < 2; slot++) {
-                if (weaponSlots[slot] >= 0 && weaponFrame(slot).contains(x, y)) {
-                    slotFingers.put(id, slot);
-                    return;
-                }
+            if (hasExtraWeapons() && weaponDrawerArrowFrame().contains(x, y)) {
+                slotFingers.put(id, WEAPON_DRAWER_TOGGLE);
+                return;
+            }
+            // Capture even empty visible frames so a weapon can be dropped
+            // into them. They do not capture aiming or gameplay input.
+            int slot = frameAt(x, y);
+            if (slot != -1) {
+                slotFingers.put(id, slot);
+                slotPositions.put(id, new float[] {x, y});
+                return;
             }
         }
         int target = hit(x, y);
@@ -712,6 +807,14 @@ public final class TouchControls extends View implements SensorEventListener, In
     }
 
     private void fingerMoved(int id, float px, float py, long eventTime) {
+        if (slotFingers.get(id, -1) >= 0) {
+            float[] position = slotPositions.get(id);
+            if (position != null) {
+                position[0] = logical(px);
+                position[1] = logical(py);
+            }
+            return;
+        }
         int control = owners.get(id, NOTHING);
         if (control >= 0 && layout.type(control) == TouchLayout.LEFT)
             moveStick(control, logical(px), logical(py));
@@ -754,10 +857,23 @@ public final class TouchControls extends View implements SensorEventListener, In
 
     private void fingerUp(int id, float px, float py) {
         int slot = slotFingers.get(id, -1);
-        if (slot >= 0) {
+        if (slot != -1) {
             slotFingers.delete(id);
-            if (weaponFrame(slot).contains(logical(px), logical(py)) && weaponSlots[slot] >= 0)
-                nativeSelectWeaponSlot(slot);
+            slotPositions.remove(id);
+            float x = logical(px), y = logical(py);
+            if (slot == WEAPON_DRAWER_TOGGLE) {
+                if (hasExtraWeapons() && weaponDrawerArrowFrame().contains(x, y)) {
+                    weaponDrawerExpanded = !weaponDrawerExpanded;
+                    nativeWeaponDrawerExpanded(modernUi && showing && !hidden && !editing
+                        && weaponDrawerExpanded);
+                }
+            } else {
+                int destination = frameAt(x, y);
+                if (destination >= 0 && destination != slot)
+                    moveWeaponBetweenFrames(slot, destination);
+                else if (destination == slot && slot < 2 && hasWeaponAtFrame(slot))
+                    nativeSelectWeaponSlot(weaponViewOrder[slot]);
+            }
             performClick();
             return;
         }
@@ -1008,6 +1124,15 @@ public final class TouchControls extends View implements SensorEventListener, In
                 }
             }
             if (modern) {
+                // Match the collapsed weapon drawer button in the gameplay HUD.
+                float arrowX = previewWidth * 0.5f - 104f - 21f;
+                float arrowY = previewHeight - 28.5f;
+                paint.setStyle(Paint.Style.STROKE);
+                paint.setStrokeWidth(2f);
+                paint.setColor(0xffcad1d4);
+                canvas.drawRect(arrowX - 16f, arrowY - 17f, arrowX + 16f, arrowY + 17f, paint);
+                canvas.drawLine(arrowX - 7f, arrowY + 4f, arrowX, arrowY - 4f, paint);
+                canvas.drawLine(arrowX, arrowY - 4f, arrowX + 7f, arrowY + 4f, paint);
                 for (int slot = 0; slot < 2; slot++) {
                     float left = previewWidth * 0.5f - 104 + slot * 106;
                     paint.setStyle(Paint.Style.STROKE);
@@ -1756,13 +1881,109 @@ public final class TouchControls extends View implements SensorEventListener, In
         paint.setStyle(Paint.Style.FILL);
     }
 
+    /**
+     * Halo's original state message contains the Xbox X glyph. On the modern
+     * touch HUD, X is the reload/action control, so cover only that glyph and
+     * draw the same reload pictogram used by the on-screen reload button.
+     * The native message text and weapon icon stay untouched/localized.
+     */
+    private void drawWeaponPickupReloadPrompt(Canvas canvas) {
+        if (!modernUi || hidden || editing || !hasWeaponPickupPrompt()) return;
+
+        // Halo's state-message button is left anchored. Touch logical units
+        // already scale from screen height, matching the native HUD. The
+        // 1600x720 capture places the X at ~208,160 physical px = 156,120
+        // logical units, and the same constants scale correctly at 540p/1080p.
+        float x = 156f;
+        float y = 120f;
+        float radius = 18f;
+
+        // Opaque enough to replace the native blue X disc underneath.
+        paint.setStyle(Paint.Style.FILL);
+        paint.setColor(alpha(0xE6313C43, layout.opacity));
+        canvas.drawCircle(x, y, radius, paint);
+        paint.setStyle(Paint.Style.STROKE);
+        paint.setStrokeWidth(1.6f);
+        paint.setColor(alpha(Color.WHITE, Math.max(0.72f, layout.opacity)));
+        canvas.drawCircle(x, y, radius, paint);
+
+        canvas.save();
+        canvas.translate(x, y);
+        float s = radius / 42f;
+        canvas.scale(s, s);
+        paint.setStrokeWidth(3.0f);
+        paint.setStrokeCap(Paint.Cap.ROUND);
+        paint.setStrokeJoin(Paint.Join.ROUND);
+        paint.setColor(alpha(Color.WHITE, Math.max(0.72f, layout.opacity)));
+        paint.setStyle(Paint.Style.STROKE);
+        Path path = new Path();
+        canvas.drawArc(new RectF(-21, -21, 21, 21), 208, 140, false, paint);
+        canvas.drawArc(new RectF(-21, -21, 21, 21), 27, 140, false, paint);
+        path.moveTo(18, -17); path.lineTo(22, -5); path.lineTo(10, -9);
+        canvas.drawPath(path, paint);
+        path.reset();
+        path.moveTo(-18, 17); path.lineTo(-22, 5); path.lineTo(-10, 9);
+        canvas.drawPath(path, paint);
+        paint.setStyle(Paint.Style.FILL);
+        for (int k = -1; k <= 1; k++) {
+            float bx = k * 9f;
+            canvas.drawRoundRect(new RectF(bx - 3, -10, bx + 3, 10), 1.2f, 1.2f, paint);
+            path.reset();
+            path.moveTo(bx - 3, -10);
+            path.lineTo(bx, -15);
+            path.lineTo(bx + 3, -10);
+            path.close();
+            canvas.drawPath(path, paint);
+        }
+        canvas.restore();
+        paint.setStyle(Paint.Style.FILL);
+    }
+
+    private void drawWeaponDrawerArrow(Canvas canvas) {
+        RectF arrow = weaponDrawerArrowFrame();
+        paint.setStyle(Paint.Style.FILL);
+        paint.setColor(alpha(0x26202930, layout.opacity));
+        canvas.drawRoundRect(arrow, 3f, 3f, paint);
+        paint.setStyle(Paint.Style.STROKE);
+        paint.setStrokeWidth(1.3f);
+        paint.setColor(alpha(0xFFCAD1D4, layout.opacity));
+        canvas.drawRoundRect(arrow, 3f, 3f, paint);
+        float cx = arrow.centerX(), cy = arrow.centerY();
+        float apex = cy + (weaponDrawerExpanded ? 4f : -4f);
+        float ends = cy + (weaponDrawerExpanded ? -4f : 4f);
+        paint.setStrokeWidth(2.5f);
+        canvas.drawLine(cx - 8f, ends, cx, apex, paint);
+        canvas.drawLine(cx, apex, cx + 8f, ends, paint);
+        paint.setStyle(Paint.Style.FILL);
+    }
+
     /** Gameplay only; original Halo ammo, shields and radar remain untouched. */
     private void drawWeaponSlotFrames(Canvas canvas) {
         if (!modernUi || hidden || editing) return;
+        if (hasExtraWeapons())
+            drawWeaponDrawerArrow(canvas);
+        if (weaponDrawerExpanded && hasExtraWeapons()) {
+            for (int slot = 2; slot < 4; slot++) {
+                RectF frame = weaponFrame(slot);
+                paint.setStyle(Paint.Style.FILL);
+                paint.setColor(alpha(0x26202930, layout.opacity));
+                canvas.drawRoundRect(frame, 2f, 2f, paint);
+                paint.setStyle(Paint.Style.STROKE);
+                paint.setStrokeWidth(weaponSlots[2] == weaponViewOrder[slot] ? 2f : 1.1f);
+                paint.setColor(alpha(weaponSlots[2] == weaponViewOrder[slot]
+                    ? 0xFFFFD64B : 0xFF8E9CA3, layout.opacity));
+                canvas.drawRoundRect(frame, 2f, 2f, paint);
+                paint.setStyle(Paint.Style.FILL);
+                paint.setTextAlign(Paint.Align.LEFT);
+                paint.setTextSize(10f);
+                canvas.drawText("0" + (slot + 1),
+                    frame.left + 6f, frame.top + 12f, paint);
+            }
+        }
         for (int slot = 0; slot < 2; slot++) {
             RectF frame = weaponFrame(slot);
-            boolean active = weaponSlots[2] == slot;
-            boolean equipped = weaponSlots[slot] >= 0;
+            boolean active = weaponSlots[2] == weaponViewOrder[slot];
+            boolean equipped = hasWeaponAtFrame(slot);
             paint.setStyle(Paint.Style.FILL);
             paint.setColor(alpha(0x26202930, layout.opacity));
             canvas.drawRoundRect(frame, 2f, 2f, paint);
@@ -1780,6 +2001,22 @@ public final class TouchControls extends View implements SensorEventListener, In
             paint.setTextAlign(Paint.Align.LEFT);
             paint.setTextSize(10f);
             canvas.drawText("0" + (slot + 1), frame.left + 6f, frame.top + 12f, paint);
+        }
+        // Highlight the destination frame during drag; the original icons
+        // remain rendered by the native HUD in their current positions.
+        for (int i = 0; i < slotFingers.size(); i++) {
+            int source = slotFingers.valueAt(i);
+            if (source < 0 || !hasWeaponAtFrame(source)) continue;
+            float[] position = slotPositions.get(slotFingers.keyAt(i));
+            if (position == null) continue;
+            int destination = frameAt(position[0], position[1]);
+            if (source < 2 || destination < 0 || destination >= 2 ||
+                    !WeaponSlotOrder.canMove(weaponViewOrder, physicalWeaponMask(),
+                        source, destination)) continue;
+            paint.setStyle(Paint.Style.STROKE);
+            paint.setStrokeWidth(2.5f);
+            paint.setColor(alpha(0xFF59DCC6, layout.opacity));
+            canvas.drawRoundRect(weaponFrame(destination), 3f, 3f, paint);
         }
         paint.setStyle(Paint.Style.FILL);
     }
@@ -1807,6 +2044,7 @@ public final class TouchControls extends View implements SensorEventListener, In
             }
         }
         drawWeaponSlotFrames(canvas);
+        drawWeaponPickupReloadPrompt(canvas);
         drawToolbar(canvas);
         canvas.restore();
     }
