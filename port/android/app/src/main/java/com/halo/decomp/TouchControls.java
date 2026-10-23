@@ -26,6 +26,7 @@ import android.os.Vibrator;
 import android.os.VibratorManager;
 import android.util.SparseArray;
 import android.util.SparseIntArray;
+import android.view.HapticFeedbackConstants;
 import android.view.InputDevice;
 import android.view.MotionEvent;
 import android.view.View;
@@ -62,12 +63,17 @@ public final class TouchControls extends View implements SensorEventListener, In
     private static final int TOOLBAR_OPTIONS = -4;
     private static final int TOOLBAR_EXPORT = -6;
     private static final int TOOLBAR_IMPORT = -7;
+    private static final int VEHICLE_ENTER_BUTTON = -8;
+    private Bitmap vehicleWheelIconBitmap;
+    private static final int VEHICLE_DRIVER = 1;
+    private static final int VEHICLE_GUNNER = 2;
+    private static final int VEHICLE_PASSENGER = 3;
     private static final float TOOLBAR_RADIUS = 28;
     private static final float OPTIONS_RADIUS = 34;
     private Bitmap jumpIconBitmap;
     private Bitmap fireIconBitmap;
     private Bitmap meleeIconBitmap;
-
+    private Bitmap grenadeIconBitmap;
 
     private Bitmap crouchIconBitmap;
 
@@ -82,6 +88,11 @@ public final class TouchControls extends View implements SensorEventListener, In
     private static final float STICK_DEAD_ZONE = 0.12f;
     private static final float STICK_REACH = 1.28f;
     private static final float STICK_KNOB_RADIUS = 24;
+    // FORWARD_DRAG_PADLOCK_V21: on-foot, forward-only drag-to-lock gesture.
+    private static final float AUTO_WALK_HINT_FORWARD = 0.63f;
+    private static final float AUTO_WALK_HINT_SIDE = 0.58f;
+    private static final float AUTO_WALK_LOCK_DISTANCE = 1.76f;
+    private static final float AUTO_WALK_LOCK_RADIUS = 0.35f;
     /** a floating stick goes where a thumb lands in this part of the display (from the lower left) */
     private static final float FLOATING_ZONE_WIDTH = 0.45f;
     private static final float FLOATING_ZONE_TOP = 0.35f;
@@ -215,6 +226,12 @@ public final class TouchControls extends View implements SensorEventListener, In
     private boolean stickFloating;
     private float stickX;
     private float stickY;
+    // FORWARD_RELEASE_TO_LOCK_V22: reaching lock only prepares it; release confirms.
+    private boolean autoWalkLocked;
+    private boolean autoWalkHintVisible;
+    private boolean autoWalkLockReady;
+    private boolean autoWalkHapticDone;
+    private int autoWalkHintPointer = -1;
     private int dragPointer = -1;
     private int dragControl = -1;
     private float dragOffsetX;
@@ -246,6 +263,7 @@ public final class TouchControls extends View implements SensorEventListener, In
     // The engine draws those sprites; Java never substitutes placeholder art.
     private final int[] weaponSlots = {-1, -1, -1, -1, -1, -1, -1, -1,
         -1, 0, -1, -1, -1, -1, -1, -1};
+    private int lastVehicleRole;
     private static final int WEAPON_DRAWER_TOGGLE = -2;
     private final android.util.SparseIntArray slotFingers = new android.util.SparseIntArray();
     private final android.util.SparseArray<float[]> slotPositions = new android.util.SparseArray<>();
@@ -262,9 +280,17 @@ public final class TouchControls extends View implements SensorEventListener, In
                 return;
             scene = nativeScene();
             updateShowing();
-            nativeTouchHudActive(modernUi && showing && !hidden && !editing);
             readBindings();
             nativeWeaponSlots(weaponSlots);
+            // Native weapon silhouettes are independent of Java's slot frames.
+            nativeTouchHudActive(modernUi && showing && !hidden && !editing && !vehicleOccupied());
+            int seatState = vehicleRole() | (vehicleOccupied() ? 16 : 0);
+            if (seatState != lastVehicleRole) {
+                lastVehicleRole = seatState;
+                // VEHICLE_STICK_PROMPT_V14: drop old combat buttons but keep
+                // the thumb already holding Move (driver <-> on foot).
+                resetForVehicleSeatChange();
+            }
             // Keep the two quick slots populated by REAL weapons. On pickup
             // or drop, promote remaining weapons from the drawer automatically.
             int occupied = physicalWeaponMask();
@@ -280,7 +306,7 @@ public final class TouchControls extends View implements SensorEventListener, In
                 weaponDrawerExpanded = false;
             nativeWeaponDisplayOrder(weaponViewOrder);
             nativeWeaponDrawerExpanded(modernUi && showing && !hidden && !editing
-                && weaponDrawerExpanded && hasExtraWeapons());
+                && !vehicleOccupied() && weaponDrawerExpanded && hasExtraWeapons());
             nativeLayoutAvailable(touchscreen && !controllerConnected && (scene & SCENE_OFF) == 0);
             if (nativeLayoutRequested() && openDialogs == 0)
                 showInterface(true);
@@ -441,7 +467,7 @@ public final class TouchControls extends View implements SensorEventListener, In
         }
         if (show != showing) {
             showing = show;
-            nativeTouchHudActive(modernUi && show && !hidden && !editing);
+            nativeTouchHudActive(modernUi && show && !hidden && !editing && !vehicleOccupied());
             reset();
             updateSensors();
         }
@@ -493,7 +519,7 @@ public final class TouchControls extends View implements SensorEventListener, In
     private void setHidden(boolean hidden) {
         reset();
         this.hidden = hidden;
-        nativeTouchHudActive(modernUi && showing && !hidden && !editing);
+        nativeTouchHudActive(modernUi && showing && !hidden && !editing && !vehicleOccupied());
         preferences.edit().putBoolean(KEY_HIDDEN, hidden).apply();
         updateSensors();
     }
@@ -514,11 +540,47 @@ public final class TouchControls extends View implements SensorEventListener, In
         lookPointer = -1;
         lookEventTime = -1;
         stickFloating = false;
+        autoWalkLocked = false;
+        autoWalkHintVisible = false;
+        autoWalkLockReady = false;
+        autoWalkHapticDone = false;
+        autoWalkHintPointer = -1;
         gyroAim.reset();
         nativeLookReset();
         Arrays.fill(axes, 0);
         publish();
         invalidate();
+    }
+
+    /** Keep the SAME Android pointer ID for Move when changing seats.
+     * reset() alone releases it, and Android cannot send another ACTION_DOWN
+     * while the thumb is still on the glass. Other pressed actions must reset.
+     * A gunner seat cannot keep the stick since it has no movement control. */
+    private void resetForVehicleSeatChange() {
+        int movePointer = -1;
+        int stick = TouchLayout.LEFT;
+        int moveX = axes[0], moveY = axes[1];
+        boolean oldFloating = stickFloating;
+        float oldStickX = stickX, oldStickY = stickY;
+        if (showing && !hidden && !editing && layout.shown(stick)
+                && vehicleControlVisible(stick)) {
+            for (int i = 0; i < owners.size(); i++) {
+                if (owners.valueAt(i) == stick) {
+                    movePointer = owners.keyAt(i);
+                    break;
+                }
+            }
+        }
+        reset();
+        if (movePointer >= 0) {
+            owners.put(movePointer, stick);
+            axes[0] = moveX;
+            axes[1] = moveY;
+            stickFloating = oldFloating;
+            stickX = oldStickX;
+            stickY = oldStickY;
+            publish();
+        }
     }
 
     private void publish() {
@@ -531,7 +593,20 @@ public final class TouchControls extends View implements SensorEventListener, In
         axes[5] = 0;
         for (int i = 0; i < owners.size(); i++) {
             int control = owners.valueAt(i);
-            if (control < 0 || control >= layout.size())
+            if (control == VEHICLE_ENTER_BUTTON) {
+                // X is the default action key, but respect custom bindings.
+                for (Kind kind : KINDS) {
+                    if (kind.gamepadButton >= 0 && kind.gamepadButton < bindings.length
+                            && bindings[kind.gamepadButton] == 2) {
+                        if (kind.bit >= 0) bits |= 1 << kind.bit;
+                        if (kind.trigger >= 0) axes[kind.trigger] = 32767;
+                        break;
+                    }
+                }
+                continue;
+            }
+            if (control < 0 || control >= layout.size() ||
+                    redundantVehicleReload(control) || !vehicleControlVisible(control))
                 continue;
             Kind kind = KINDS[layout.type(control)];
             if (kind.bit >= 0)
@@ -580,6 +655,83 @@ public final class TouchControls extends View implements SensorEventListener, In
         axes[1] = Math.round(dy * 32767);
     }
 
+    /** The temporary lock target is above the move-stick rim. All positions
+     * are in logical HUD units, the same coordinates as finger movement. */
+    private float autoWalkLockX() {
+        float r = layout.radius(TouchLayout.LEFT);
+        return Math.max(r * AUTO_WALK_LOCK_RADIUS + 3f,
+            Math.min(logicalWidth - r * AUTO_WALK_LOCK_RADIUS - 3f, stickCenterX()));
+    }
+
+    private float autoWalkLockY() {
+        float r = layout.radius(TouchLayout.LEFT);
+        return Math.max(r * AUTO_WALK_LOCK_RADIUS + 3f,
+            stickCenterY() - r * AUTO_WALK_LOCK_DISTANCE);
+    }
+
+    /** A short, gentle hardware pulse. View.performHapticFeedback(CLOCK_TICK)
+     * can be silently ignored by some game/overlay configurations. The game
+     * already has VIBRATE permission and a Vibrator for controller rumble.
+     * This is independent of the game's optional continuous rumble toggle. */
+    private void vibrateForwardLockReached() {
+        if (vibrator == null || !vibrator.hasVibrator()) {
+            performHapticFeedback(HapticFeedbackConstants.KEYBOARD_TAP);
+            return;
+        }
+        try {
+            int strength = vibrator.hasAmplitudeControl()
+                ? 105 : VibrationEffect.DEFAULT_AMPLITUDE;
+            AudioAttributes attributes = new AudioAttributes.Builder()
+                .setUsage(AudioAttributes.USAGE_ASSISTANCE_SONIFICATION)
+                .setContentType(AudioAttributes.CONTENT_TYPE_SONIFICATION)
+                .build();
+            vibrator.vibrate(VibrationEffect.createOneShot(28L, strength), attributes);
+        } catch (RuntimeException ignored) {
+            // Some devices disallow direct pulses: still try framework haptics.
+            performHapticFeedback(HapticFeedbackConstants.KEYBOARD_TAP);
+        }
+    }
+
+    /** Only the Move pointer may reach this temporary target. Reaching it
+     * HIGHLIGHTS the lock (and lightly ticks once); it does NOT start auto-walk.
+     * Only releasing the SAME finger on the lock can commit the action. */
+    private void trackForwardLockArm(int pointer, float x, float y) {
+        if (autoWalkLocked) return;
+        if (!modernUi || !showing || hidden || editing || vehicleOccupied()
+                || owners.get(pointer, NOTHING) != TouchLayout.LEFT) {
+            autoWalkHintVisible = false;
+            autoWalkLockReady = false;
+            autoWalkHintPointer = -1;
+            return;
+        }
+        float radius = layout.radius(TouchLayout.LEFT);
+        if (radius <= 0) {
+            autoWalkHintVisible = false;
+            autoWalkLockReady = false;
+            autoWalkHintPointer = -1;
+            return;
+        }
+        float dx = (x - stickCenterX()) / radius;
+        float dy = (y - stickCenterY()) / radius;
+        if (dy > -AUTO_WALK_HINT_FORWARD || Math.abs(dx) > AUTO_WALK_HINT_SIDE) {
+            autoWalkHintVisible = false;
+            autoWalkLockReady = false;
+            autoWalkHintPointer = -1;
+            return;
+        }
+        autoWalkHintVisible = true;
+        autoWalkHintPointer = pointer;
+        float hitRadius = Math.max(18f, radius * AUTO_WALK_LOCK_RADIUS);
+        boolean reached = inside(x, y, autoWalkLockX(), autoWalkLockY(), hitRadius);
+        if (reached && !autoWalkLockReady && !autoWalkHapticDone) {
+            // FORWARD_LOCK_HAPTIC_V23: real short vibration on arrival, once
+            // per drag gesture; reaching does not engage auto-walk.
+            vibrateForwardLockReached();
+            autoWalkHapticDone = true;
+        }
+        autoWalkLockReady = reached;
+    }
+
     // ---------- fingers
 
     private static boolean inside(float x, float y, float cx, float cy, float radius) {
@@ -596,6 +748,191 @@ public final class TouchControls extends View implements SensorEventListener, In
         return button >= 0 && button < bindings.length && bindings[button] == 3;
     }
 
+    /** Read the role from the same native state used by the vehicle ENTER cue.
+     * Bit 6 carries the seat-tag allow-weapons capability for passengers. */
+    private int vehicleRole() {
+        if (!vehicleOccupied()) return 0;
+        return (weaponSlots[9] >> 4) & 3;
+    }
+
+    /** VEHICLE_WEAPON_PICKUP_PRIORITY_V11: real Hold-X ground-item prompts
+     * always use the infantry HUD, even with stale vehicle bits. */
+    private boolean groundItemPrompt() {
+        return (weaponSlots[9] & 512) != 0;
+    }
+
+    /** VEHICLE_FLIP_RELOAD_PROMPT_V18: only native action "flip vehicle". */
+    private boolean vehicleFlipPrompt() {
+        return modernUi && !editing && !vehicleOccupied()
+            && (weaponSlots[9] & 2048) != 0;
+    }
+
+    /** A valid occupant has BOTH a native occupied bit and a resolved seat
+     * role (driver/gunner/passenger). Never hide everything for role zero. */
+    private boolean vehicleOccupied() {
+        return modernUi && !editing && !groundItemPrompt()
+            && (weaponSlots[9] & 256) != 0 && (weaponSlots[9] & 48) != 0;
+    }
+
+    /** VEHICLE_GHOST_SECONDARY_V12: native bit from the real occupied vehicle. */
+    private boolean vehicleIsGhost() {
+        return vehicleOccupied() && (weaponSlots[9] & 1024) != 0;
+    }
+
+    private boolean passengerCanFire() {
+        return (weaponSlots[9] & 64) != 0;
+    }
+
+    /** v5: Bit 7 is set by the native engine ONLY when a driver's seat
+     * also controls the vehicle's weapon/gunner (never by vehicle name). */
+    private boolean vehicleDriverHasWeapons() {
+        return (weaponSlots[9] & 128) != 0;
+    }
+
+    /** In EVERY vehicle: no Jump, Crouch, Melee or weapon switching.
+     * Driver of Warthog: steering + wheel/EXIT. Armed driver: Fire and
+     * secondary Fire. Gunner: Fire/secondary Fire/Zoom. Armed passenger:
+     * Fire/Zoom. Unknown seats preserve steering and both trigger buttons
+     * rather than accidentally blocking a modded vehicle's weapons.
+     * Real control bindings are honored instead of assuming buttons A/B/RT. */
+    /** VEHICLE_RELOAD_DUPLICATE_FIX_V9: the wheel already sends Reload/Use
+     * (game action 2) for EXIT. Hide the old standalone action only while
+     * seated in Modern HUD; do not assume the physical button is always X. */
+    private boolean redundantVehicleReload(int control) {
+        if (!vehicleOccupied() || control < 0 || control >= layout.size())
+            return false;
+        int type = layout.type(control);
+        if (type < 0 || type >= KINDS.length) return false;
+        int button = KINDS[type].gamepadButton;
+        // Also hide the physical X pictogram if a custom binding moved Reload.
+        if (button == 12 || button == 13) return false; // Back / Pause
+        return button == 2 || (button >= 0 && button < bindings.length
+            && bindings[button] == 2);
+    }
+
+    private boolean vehicleControlVisible(int control) {
+        if (!vehicleOccupied()) return true;
+        int role = vehicleRole();
+        int type = layout.type(control);
+        if (type == TouchLayout.LEFT)
+            return role == VEHICLE_DRIVER || role == 0;
+        if (type < 0 || type >= KINDS.length) return false;
+        Kind kind = KINDS[type];
+        if (kind.gamepadButton < 0 || kind.gamepadButton >= bindings.length)
+            return false;
+        int action = bindings[kind.gamepadButton];
+        // System/menu actions must remain visible and touchable in every seat.
+        if (kind.gamepadButton == 12 || kind.gamepadButton == 13 ||
+                action == 8 || action == 9) return true; // Pause / Back
+        // Only the contextual steering wheel should provide X while seated.
+        if (kind.gamepadButton == 2 || action == 2) return false;
+        if (role == VEHICLE_DRIVER)
+            return vehicleDriverHasWeapons() &&
+                (action == 7 || (action == 6 && !vehicleIsGhost()));
+        if (role == VEHICLE_GUNNER)
+            return action == 7 || action == 6 || action == 11;
+        if (role == VEHICLE_PASSENGER)
+            return passengerCanFire() && (action == 7 || action == 11);
+        // Unknown seat: prefer usable driving/guns without infantry buttons.
+        return action == 7 || action == 6;
+    }
+
+    /** Show ENTER on foot when Halo resolves an available seat, or EXIT
+     * throughout the time our unit actually occupies a vehicle seat. */
+    private boolean vehicleEnterAvailable() {
+        return modernUi && showing && !hidden && !editing
+            && !groundItemPrompt()
+            && ((weaponSlots[9] & 8) != 0 || vehicleOccupied());
+    }
+
+    /** Put the contextual button immediately LEFT of the grenade-throw control,
+     * following that control if the user moved/resized it in the layout editor. */
+    private float[] vehicleEnterPosition() {
+        if (!vehicleEnterAvailable()) return null;
+        for (int i = 0; i < layout.size(); i++) {
+            if ((!vehicleOccupied() && !layout.shown(i)) ||
+                    layout.type(i) == TouchLayout.LEFT) continue;
+            int type = layout.type(i);
+            if (type < 0 || type >= KINDS.length) continue;
+            Kind kind = KINDS[type];
+            if (kind.gamepadButton < 0 || kind.gamepadButton >= bindings.length
+                    || bindings[kind.gamepadButton] != 6) continue;
+            float radius = Math.max(22f, Math.min(32f, layout.radius(i) * 0.78f));
+            float x = layout.x(i) - layout.radius(i) - radius - 8f;
+            if (x < radius + 2f) {
+                if (!vehicleOccupied()) return null;
+                x = radius + 2f;
+            }
+            return new float[] {x, layout.y(i), radius};
+        }
+        // A modded profile might unbind Grenade entirely. Still allow EXIT.
+        if (vehicleOccupied()) {
+            float radius = 28f;
+            return new float[] {logicalWidth * 0.74f, logicalHeight * 0.43f, radius};
+        }
+        return null;
+    }
+
+    /** Transparent wheel for both ENTER and EXIT, same contextual action. */
+    private Bitmap getVehicleWheelIconBitmap() {
+        if (vehicleWheelIconBitmap == null)
+            vehicleWheelIconBitmap = BitmapFactory.decodeResource(
+                getResources(), R.drawable.vehicle_steering_wheel);
+        return vehicleWheelIconBitmap;
+    }
+
+    /** Replace the native blue X pictogram of the vehicle-entry message.
+     * The native message text and seat/vehicle names remain untouched. The
+     * wheel is only an overlay on its pictogram, not a new game action.
+     * Use fractions of the viewport because Halo scales its HUD independently
+     * of Android's user-customisable gameplay buttons. */
+    private void drawVehiclePromptWheel(Canvas canvas) {
+        if (!modernUi || !showing || hidden || editing || vehicleOccupied()
+                || groundItemPrompt() || (weaponSlots[9] & 8) == 0)
+            return;
+        Bitmap wheel = getVehicleWheelIconBitmap();
+        if (wheel == null) return;
+        // VEHICLE_WHEEL_PROMPT_ALIGN_V15: align the wheel with the *blue X*
+        // in Halo's native enter-seat prompt, not below the prompt text.
+        // Calibrated on the supplied 957x544 Android screenshot; fractions
+        // keep the placement relative to the same logical viewport.
+        // VEHICLE_WHEEL_PROMPT_ALIGN_V16: subir un poco más para cubrir la X azul.
+        // VEHICLE_WHEEL_PROMPT_SIZE_V17: más grande SOLO sobre la X del mensaje.
+        // El botón ENTER/EXIT de la pantalla conserva su tamaño original.
+        float x = logicalWidth * 0.139f;
+        float y = logicalHeight * 0.214f;
+        float radius = Math.max(17f, Math.min(24f, logicalHeight * 0.041f));
+        // Cover the blue X in the game's message, never the surrounding text.
+        paint.setStyle(Paint.Style.FILL);
+        paint.setColor(0xFF19344B);
+        paint.setAlpha(255);
+        canvas.drawCircle(x, y, radius, paint);
+        paint.setColor(Color.WHITE);
+        paint.setAlpha(255);
+        paint.setFilterBitmap(true);
+        float half = radius * 0.77f;
+        canvas.drawBitmap(wheel, null,
+            new RectF(x - half, y - half, x + half, y + half), paint);
+    }
+
+    private void drawVehicleEnterButton(Canvas canvas) {
+        float[] pos = vehicleEnterPosition();
+        if (pos == null) return;
+        boolean active = owners.indexOfValue(VEHICLE_ENTER_BUTTON) >= 0;
+        // Preserve the original translucent circle and press feedback.
+        circle(canvas, pos[0], pos[1], pos[2], "", active, 10f, layout.opacity);
+        Bitmap wheel = getVehicleWheelIconBitmap();
+        if (wheel == null) return;
+        paint.setStyle(Paint.Style.FILL);
+        paint.setColor(Color.WHITE);
+        paint.setAlpha(Math.round(255f * Math.max(0.55f, layout.opacity)));
+        paint.setFilterBitmap(true);
+        float half = pos[2] * 0.69f;
+        canvas.drawBitmap(wheel, null,
+            new RectF(pos[0] - half, pos[1] - half,
+                      pos[0] + half, pos[1] + half), paint);
+    }
+
     /** what is under a point (logical units): a toolbar item, a control, or NOTHING */
     private int hit(float x, float y) {
         if (inside(x, y, optionsX(), toolbarY(), toolbarRadius(OPTIONS_RADIUS)))
@@ -608,8 +945,12 @@ public final class TouchControls extends View implements SensorEventListener, In
             return TOOLBAR_TOGGLE;
         if (hidden && !editing)
             return NOTHING;
+        float[] vehicle = vehicleEnterPosition();
+        if (vehicle != null && inside(x, y, vehicle[0], vehicle[1], vehicle[2]))
+            return VEHICLE_ENTER_BUTTON;
         for (int i = 0; i < layout.size(); i++) {
             if (layout.shown(i) && layout.type(i) != TouchLayout.LEFT
+                    && !redundantVehicleReload(i) && vehicleControlVisible(i)
                     && (!modernUi || !isGameplayDpad(layout.type(i)))
                     && (!modernUi || editing || !isWeaponSwitchControl(layout.type(i)))
                     && inside(x, y, layout.x(i), layout.y(i), layout.radius(i)))
@@ -617,7 +958,7 @@ public final class TouchControls extends View implements SensorEventListener, In
         }
         int stick = TouchLayout.LEFT;
         float reach = editing ? 1 : STICK_REACH;
-        if (layout.shown(stick) && !held(stick)
+        if (layout.shown(stick) && vehicleControlVisible(stick) && !held(stick)
                 && inside(x, y, layout.x(stick), layout.y(stick), layout.radius(stick) * reach))
             return stick;
         return NOTHING;
@@ -704,7 +1045,12 @@ public final class TouchControls extends View implements SensorEventListener, In
 
     /** Halo is currently showing a pickup/swap prompt for a weapon. */
     private boolean hasWeaponPickupPrompt() {
-        return (weaponSlots[9] & (1 << 8)) != 0;
+        // VEHICLE_PROMPT_ICON_BIT_COLLISION_V13
+        // Before: bit 8 (256) indicated a ground pickup, but v8 reused it
+        // for an occupied vehicle seat. That painted a floating Reload icon
+        // on every vehicle even after its actual button was hidden.
+        // v11 defines bit 9 (512) exclusively for an on-foot item prompt.
+        return groundItemPrompt() && !vehicleOccupied();
     }
 
     private int physicalWeaponMask() {
@@ -759,7 +1105,7 @@ public final class TouchControls extends View implements SensorEventListener, In
             return;
         float x = logical(px);
         float y = logical(py);
-        if (modernUi && !editing && !hidden) {
+        if (modernUi && !editing && !hidden && !vehicleOccupied()) {
             if (hasExtraWeapons() && weaponDrawerArrowFrame().contains(x, y)) {
                 slotFingers.put(id, WEAPON_DRAWER_TOGGLE);
                 return;
@@ -775,18 +1121,28 @@ public final class TouchControls extends View implements SensorEventListener, In
         }
         int target = hit(x, y);
         int stick = TouchLayout.LEFT;
-        if (target == NOTHING && layout.floatingStick && !hidden && layout.shown(stick) && !held(stick)
+        if (target == NOTHING && layout.floatingStick && !hidden && layout.shown(stick)
+                && vehicleControlVisible(stick) && !held(stick)
                 && inFloatingZone(x, y) && !inGestureZone(px, py, false)) {
             floatStick(x, y);
             target = stick;
         }
         if (target == TOOLBAR_OPTIONS || target == TOOLBAR_TOGGLE) {
             toolbarFingers.put(id, new float[] {px, py, target});
+        } else if (target == VEHICLE_ENTER_BUTTON) {
+            owners.put(id, target);
         } else if (target != NOTHING) {
             owners.put(id, target);
-            if (layout.type(target) == TouchLayout.LEFT)
+            if (layout.type(target) == TouchLayout.LEFT) {
+                // A new thumb on Move instantly cancels the previous auto-walk.
+                autoWalkLocked = false;
+                autoWalkHintVisible = false;
+                autoWalkLockReady = false;
+                autoWalkHapticDone = false;
+                autoWalkHintPointer = -1;
                 moveStick(target, x, y);
-            else
+                trackForwardLockArm(id, x, y);
+            } else
                 buttonTouches.put(id, new float[] {px, py});
         } else if (!hidden && lookPointer < 0 && !inGestureZone(px, py, false)) {
             startLook(id, px, py);
@@ -816,8 +1172,12 @@ public final class TouchControls extends View implements SensorEventListener, In
             return;
         }
         int control = owners.get(id, NOTHING);
-        if (control >= 0 && layout.type(control) == TouchLayout.LEFT)
-            moveStick(control, logical(px), logical(py));
+        if (control >= 0 && layout.type(control) == TouchLayout.LEFT) {
+            if (!autoWalkLocked) {
+                moveStick(control, logical(px), logical(py));
+                trackForwardLockArm(id, logical(px), logical(py));
+            }
+        }
         float[] toolbar = toolbarFingers.get(id);
         if (toolbar != null && movedPastSlop(toolbar, px, py)) {
             // a swipe that began on the toolbar aims; the item does not act
@@ -862,10 +1222,10 @@ public final class TouchControls extends View implements SensorEventListener, In
             slotPositions.remove(id);
             float x = logical(px), y = logical(py);
             if (slot == WEAPON_DRAWER_TOGGLE) {
-                if (hasExtraWeapons() && weaponDrawerArrowFrame().contains(x, y)) {
+                if (!vehicleOccupied() && hasExtraWeapons() && weaponDrawerArrowFrame().contains(x, y)) {
                     weaponDrawerExpanded = !weaponDrawerExpanded;
                     nativeWeaponDrawerExpanded(modernUi && showing && !hidden && !editing
-                        && weaponDrawerExpanded);
+                        && !vehicleOccupied() && weaponDrawerExpanded);
                 }
             } else {
                 int destination = frameAt(x, y);
@@ -888,8 +1248,22 @@ public final class TouchControls extends View implements SensorEventListener, In
         }
         int control = owners.get(id, NOTHING);
         if (control >= 0 && layout.type(control) == TouchLayout.LEFT) {
+            // Release, not reaching the target, commits auto-walk. Verify the
+            // last UP position (Android may send UP without a final MOVE).
+            if (!autoWalkLocked && autoWalkHintVisible && autoWalkHintPointer == id)
+                trackForwardLockArm(id, logical(px), logical(py));
+            boolean engage = modernUi && showing && !hidden && !editing
+                && !vehicleOccupied() && autoWalkHintVisible
+                && autoWalkHintPointer == id && autoWalkLockReady
+                && inside(logical(px), logical(py), autoWalkLockX(), autoWalkLockY(),
+                    Math.max(18f, layout.radius(TouchLayout.LEFT) * AUTO_WALK_LOCK_RADIUS));
+            autoWalkLocked = engage;
             axes[0] = 0;
-            axes[1] = 0;
+            axes[1] = engage ? -32767 : 0;
+            autoWalkHintVisible = false;
+            autoWalkLockReady = false;
+            autoWalkHapticDone = false;
+            autoWalkHintPointer = -1;
             stickFloating = false;
         }
         if (id == lookPointer) {
@@ -1036,7 +1410,8 @@ public final class TouchControls extends View implements SensorEventListener, In
                 } else if (which == 2) {
                     post(this::showSensitivity);
                 } else {
-                    post(this::showInterface);
+                    // TOUCH_OPTIONS_DIRECT_SWITCH_V19: toggle without campaign welcome dialog.
+                    post(() -> selectInterface(!modernUi));
                 }
             })
             .setNegativeButton("Close", null)
@@ -1056,7 +1431,7 @@ public final class TouchControls extends View implements SensorEventListener, In
         loadLayout(getContext());
         layout.bounds(logicalWidth, logicalHeight);
         layout.setMinimumRadius(minimumRadius());
-        nativeTouchHudActive(modernUi && showing && !hidden && !editing);
+        nativeTouchHudActive(modernUi && showing && !hidden && !editing && !vehicleOccupied());
         cancelRumble();
         updateSensors();
         invalidate();
@@ -1602,13 +1977,13 @@ public final class TouchControls extends View implements SensorEventListener, In
 
     private Bitmap getCrouchIconBitmap() {
         if (crouchIconBitmap == null)
-            crouchIconBitmap = BitmapFactory.decodeResource(getResources(), R.drawable.crouch_spartan);
+            crouchIconBitmap = BitmapFactory.decodeResource(getResources(), R.drawable.crouch_soldier);
         return crouchIconBitmap;
     }
 
     private Bitmap getJumpIconBitmap() {
         if (jumpIconBitmap == null)
-            jumpIconBitmap = BitmapFactory.decodeResource(getResources(), R.drawable.jump_spartan);
+            jumpIconBitmap = BitmapFactory.decodeResource(getResources(), R.drawable.jump_soldier);
         return jumpIconBitmap;
     }
 
@@ -1623,9 +1998,16 @@ public final class TouchControls extends View implements SensorEventListener, In
 
     private Bitmap getMeleeIconBitmap() {
         if (meleeIconBitmap == null) {
-            meleeIconBitmap = BitmapFactory.decodeResource(getResources(), R.drawable.melee_energy_sword);
+            meleeIconBitmap = BitmapFactory.decodeResource(getResources(), R.drawable.melee_punch);
         }
         return meleeIconBitmap;
+    }
+
+    private Bitmap getGrenadeIconBitmap() {
+        if (grenadeIconBitmap == null) {
+            grenadeIconBitmap = BitmapFactory.decodeResource(getResources(), R.drawable.grenade_throw);
+        }
+        return grenadeIconBitmap;
     }
 
     /** Original tactical HUD pictograms; only in gameplay, never in Halo's touch menus. */
@@ -1634,6 +2016,9 @@ public final class TouchControls extends View implements SensorEventListener, In
         Kind kind = KINDS[type];
         if (kind.gamepadButton >= 0 && kind.gamepadButton < bindings.length)
             action = bindings[kind.gamepadButton];
+        // Renderer safeguard: only the steering wheel presents EXIT while seated.
+        if (vehicleOccupied() && kind.gamepadButton != 12 && kind.gamepadButton != 13
+                && (action == 2 || kind.gamepadButton == 2)) return;
         if (action < 0 || action >= GAME_CONTROLS.length) {
             circle(canvas, x, y, radius, kind.buttonName, active, 11, opacity);
             return;
@@ -1657,13 +2042,13 @@ public final class TouchControls extends View implements SensorEventListener, In
         paint.setStyle(Paint.Style.STROKE);
         Path path = new Path();
         switch (action) {
-            case 7: { // FIRE: projectile icon provided by the user
+            case 7: { // FIRE: original monochrome projectile icon
                 Bitmap fire = getFireIconBitmap();
                 if (fire != null) {
                     paint.setStyle(Paint.Style.FILL);
                     paint.setColor(alpha(Color.WHITE, Math.max(0.55f, opacity)));
-                    float maxW = 28f;
-                    float maxH = 28f;
+                    float maxW = 52f;
+                    float maxH = 52f;
                     float bw = fire.getWidth();
                     float bh = fire.getHeight();
                     float bitmapScale = Math.min(maxW / bw, maxH / bh);
@@ -1713,14 +2098,14 @@ public final class TouchControls extends View implements SensorEventListener, In
                 }
                 paint.setStyle(Paint.Style.STROKE);
                 break;
-            case 0: { // JUMP: exact jumping Spartan image provided by user
+            case 0: { // JUMP: original monochrome jump icon
                 Bitmap jump = getJumpIconBitmap();
                 if (jump != null) {
                     paint.setStyle(Paint.Style.FILL);
                     paint.setColor(alpha(Color.WHITE, Math.max(0.55f, opacity)));
                     float bw = jump.getWidth();
                     float bh = jump.getHeight();
-                    float bitmapScale = Math.min(28f / bw, 28f / bh);
+                    float bitmapScale = Math.min(58f / bw, 58f / bh);
                     float dx = bw * bitmapScale * 0.5f;
                     float dy = bh * bitmapScale * 0.5f;
                     canvas.drawBitmap(jump, null, new RectF(-dx, -dy, dx, dy), paint);
@@ -1728,13 +2113,13 @@ public final class TouchControls extends View implements SensorEventListener, In
                 }
                 break;
             }
-            case 10: { // CROUCH: use the exact kneeling Spartan icon provided by the user
+            case 10: { // CROUCH: original monochrome crouch icon
                 Bitmap crouch = getCrouchIconBitmap();
                 if (crouch != null) {
                     paint.setStyle(Paint.Style.FILL);
                     paint.setColor(alpha(Color.WHITE, Math.max(0.55f, opacity)));
-                    float maxW = 28f;
-                    float maxH = 26f;
+                    float maxW = 58f;
+                    float maxH = 54f;
                     float bw = crouch.getWidth();
                     float bh = crouch.getHeight();
                     float bitmapScale = Math.min(maxW / bw, maxH / bh);
@@ -1767,25 +2152,59 @@ public final class TouchControls extends View implements SensorEventListener, In
                 }
                 break;
             }
-            case 6: // GRENADE
-                canvas.drawOval(new RectF(-12, -12, 12, 20), paint);
-                canvas.drawRoundRect(new RectF(-5, -19, 6, -12), 2, 2, paint);
-                canvas.drawArc(new RectF(3, -23, 16, -11), 175, 175, false, paint);
-                line(canvas, -11, 0, 11, 0); line(canvas, 0, -10, 0, 18);
+            case 6: { // GRENADE: original monochrome throw icon
+                // SECONDARY_VEHICLE_FIRE_V7: Halo CE uses the grenade/LT action as
+                // the vehicle weapon's SECONDARY trigger (not a weapon switch).
+                // Only change the artwork while piloting an armed vehicle.
+                if (vehicleRole() == VEHICLE_DRIVER && vehicleDriverHasWeapons()
+                        && !vehicleIsGhost()) {
+                    paint.setStyle(Paint.Style.STROKE);
+                    paint.setStrokeWidth(2.7f);
+                    // Secondary weapon: twin cannon barrels with a flash.
+                    canvas.drawRoundRect(new RectF(-21f, -13f, 7f, -4f), 2f, 2f, paint);
+                    canvas.drawRoundRect(new RectF(-21f, 4f, 7f, 13f), 2f, 2f, paint);
+                    canvas.drawLine(7f, -8f, 17f, -8f, paint);
+                    canvas.drawLine(7f, 8f, 17f, 8f, paint);
+                    canvas.drawLine(17f, -8f, 23f, -17f, paint);
+                    canvas.drawLine(17f, -8f, 25f, -8f, paint);
+                    canvas.drawLine(17f, 8f, 23f, 17f, paint);
+                    canvas.drawLine(17f, 8f, 25f, 8f, paint);
+                    break;
+                }
+                Bitmap grenade = getGrenadeIconBitmap();
+                if (grenade != null) {
+                    paint.setStyle(Paint.Style.FILL);
+                    paint.setColor(alpha(Color.WHITE, Math.max(0.55f, opacity)));
+                    float maxW = 50f;
+                    float maxH = 42f;
+                    float bw = grenade.getWidth();
+                    float bh = grenade.getHeight();
+                    float bitmapScale = Math.min(maxW / bw, maxH / bh);
+                    float dx = bw * bitmapScale * 0.5f;
+                    float dy = bh * bitmapScale * 0.5f;
+                    canvas.drawBitmap(grenade, null, new RectF(-dx, -dy, dx, dy), paint);
+                    paint.setStyle(Paint.Style.STROKE);
+                } else {
+                    canvas.drawOval(new RectF(-12, -12, 12, 20), paint);
+                    canvas.drawRoundRect(new RectF(-5, -19, 6, -12), 2, 2, paint);
+                    canvas.drawArc(new RectF(3, -23, 16, -11), 175, 175, false, paint);
+                    line(canvas, -11, 0, 11, 0); line(canvas, 0, -10, 0, 18);
+                }
                 break;
+            }
             case 3: // SWITCH WEAPON
                 line(canvas, -19, -9, 18, -9); line(canvas, 18, -9, 11, -15);
                 line(canvas, 18, -9, 11, -3);
                 line(canvas, 19, 9, -18, 9); line(canvas, -18, 9, -11, 3);
                 line(canvas, -18, 9, -11, 15);
                 break;
-            case 4: { // MELEE: energy-sword Spartan icon provided by the user
+            case 4: { // MELEE: original monochrome melee icon
                 Bitmap melee = getMeleeIconBitmap();
                 if (melee != null) {
                     paint.setStyle(Paint.Style.FILL);
                     paint.setColor(alpha(Color.WHITE, Math.max(0.55f, opacity)));
-                    float maxW = 29f;
-                    float maxH = 29f;
+                    float maxW = 58f;
+                    float maxH = 58f;
                     float bw = melee.getWidth();
                     float bh = melee.getHeight();
                     float bitmapScale = Math.min(maxW / bw, maxH / bh);
@@ -1855,6 +2274,40 @@ public final class TouchControls extends View implements SensorEventListener, In
         circle(canvas, x, y, radius, "Move", false, 11 * size, layout.opacity);
         circle(canvas, x + axes[0] / 32767f * radius, y + axes[1] / 32767f * radius,
             Math.max(STICK_KNOB_RADIUS * size, radius * 0.375f), "", held(stick), 11, layout.opacity);
+        // Only draw the lock while the same thumb is PUSHING FORWARD.
+        // Once engaged, the temporary padlock disappears; no text overlays.
+        if (modernUi && showing && !hidden && !editing && !vehicleOccupied()
+                && autoWalkHintVisible && !autoWalkLocked
+                && autoWalkHintPointer >= 0
+                && owners.get(autoWalkHintPointer, NOTHING) == stick) {
+            Paint saved = new Paint(paint);
+            float cx = autoWalkLockX(), cy = autoWalkLockY();
+            float r = Math.max(18f, radius * AUTO_WALK_LOCK_RADIUS);
+            paint.setStyle(Paint.Style.FILL);
+            paint.setColor(alpha(0xB21A3646, layout.opacity));
+            canvas.drawCircle(cx, cy, r, paint);
+            paint.setStyle(Paint.Style.STROKE);
+            paint.setStrokeWidth(2.2f);
+            paint.setColor(alpha(autoWalkLockReady ? 0xFFB8F7FF : 0xFF8CE4FF,
+                layout.opacity));
+            canvas.drawCircle(cx, cy, r, paint);
+            // Bright ring means RELEASE HERE to engage; no new asset.
+            if (autoWalkLockReady) {
+                paint.setStrokeWidth(3.7f);
+                canvas.drawCircle(cx, cy, r - 3f, paint);
+            }
+            // Simple unlocked-padlock glyph. No PNG or extra touch button.
+            paint.setColor(alpha(Color.WHITE, layout.opacity));
+            paint.setStrokeWidth(2.6f);
+            float w = r * 0.75f;
+            RectF body = new RectF(cx - w / 2f, cy - r * 0.06f,
+                cx + w / 2f, cy + r * 0.62f);
+            canvas.drawRoundRect(body, 2.5f, 2.5f, paint);
+            RectF shackle = new RectF(cx - r * 0.27f, cy - r * 0.49f,
+                cx + r * 0.27f, cy + r * 0.23f);
+            canvas.drawArc(shackle, 180f, 180f, false, paint);
+            paint.set(saved);
+        }
     }
 
     /** White, compact gun silhouettes drawn from the engine's weapon IDs. */
@@ -1888,19 +2341,26 @@ public final class TouchControls extends View implements SensorEventListener, In
      * The native message text and weapon icon stay untouched/localized.
      */
     private void drawWeaponPickupReloadPrompt(Canvas canvas) {
-        if (!modernUi || hidden || editing || !hasWeaponPickupPrompt()) return;
+        // VEHICLE_FLIP_RELOAD_PROMPT_V18: original Reload icon for flip,
+        // normal on-foot weapon pickup artwork unchanged.
+        if (!modernUi || hidden || editing ||
+            (!hasWeaponPickupPrompt() && !vehicleFlipPrompt())) return;
 
         // Halo's state-message button is left anchored. Touch logical units
         // already scale from screen height, matching the native HUD. The
         // 1600x720 capture places the X at ~208,160 physical px = 156,120
         // logical units, and the same constants scale correctly at 540p/1080p.
-        float x = 156f;
-        float y = 120f;
-        float radius = 18f;
+        boolean flip = vehicleFlipPrompt();
+        // The flip X shares Halo's state-message anchor with Enter.
+        // Keep the old constants EXACTLY for weapon pickups.
+        float x = flip ? logicalWidth * 0.139f : 156f;
+        float y = flip ? logicalHeight * 0.214f : 120f;
+        float radius = flip ? Math.max(17f, Math.min(24f, logicalHeight * 0.041f)) : 18f;
 
         // Opaque enough to replace the native blue X disc underneath.
         paint.setStyle(Paint.Style.FILL);
-        paint.setColor(alpha(0xE6313C43, layout.opacity));
+        // Flip needs an opaque cover for the native blue Xbox X glyph.
+        paint.setColor(flip ? 0xFF19344B : alpha(0xE6313C43, layout.opacity));
         canvas.drawCircle(x, y, radius, paint);
         paint.setStyle(Paint.Style.STROKE);
         paint.setStrokeWidth(1.6f);
@@ -2028,10 +2488,11 @@ public final class TouchControls extends View implements SensorEventListener, In
         canvas.save();
         canvas.scale(scale, scale);
         if (!hidden || editing) {
-            if (layout.shown(TouchLayout.LEFT))
+            if (layout.shown(TouchLayout.LEFT) && vehicleControlVisible(TouchLayout.LEFT))
                 drawStick(canvas);
             for (int i = 0; i < layout.size(); i++) {
                 if (!layout.shown(i) || layout.type(i) == TouchLayout.LEFT
+                        || redundantVehicleReload(i) || !vehicleControlVisible(i)
                         || (modernUi && isGameplayDpad(layout.type(i)))
                         || (modernUi && !editing && isWeaponSwitchControl(layout.type(i))))
                     continue;
@@ -2043,8 +2504,11 @@ public final class TouchControls extends View implements SensorEventListener, In
                     held(i) || dragControl == i, layout.opacity);
             }
         }
-        drawWeaponSlotFrames(canvas);
+        if (!vehicleOccupied())
+            drawWeaponSlotFrames(canvas);
         drawWeaponPickupReloadPrompt(canvas);
+        drawVehicleEnterButton(canvas);
+        drawVehiclePromptWheel(canvas);
         drawToolbar(canvas);
         canvas.restore();
     }

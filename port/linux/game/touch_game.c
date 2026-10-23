@@ -16,6 +16,7 @@ game. The platform layer cannot see the game's types, so it asks here
 #include "game/players.h"
 #include "game/local_players.h"
 #include "units/units.h"
+#include "units/unit_definitions.h"
 #include "items/weapons.h"
 #include "items/weapon_definitions.h"
 #include "interface/weapon_hud_interface_definition.h"
@@ -48,6 +49,189 @@ first, as touch_game_cinematic_skippable has it */
 int touch_game_playing(void)
 {
 	return cinematic_globals && game_in_progress() && !main_menu_is_active();
+}
+
+/* Android-only HUD cue. Reuse Halo's own resolved nearby interaction;
+ * it already checks seat availability, player velocity and vehicle orientation.
+ * Do not infer enterability from distance alone. */
+int touch_game_vehicle_enter_available(void)
+{
+    long unit_index;
+    struct unit_datum *unit;
+    struct player_datum *player;
+    struct object_datum *target;
+
+    if (!touch_game_playing()) return 0;
+    unit_index = player_control_get_unit_index(0);
+    if (unit_index == NONE) return 0;
+    unit = unit_get(unit_index);
+    if (!unit || unit->object.parent_object_index != NONE ||
+        unit->unit.player_index == NONE) return 0;
+    player = player_try_and_get(unit->unit.player_index);
+    if (!player || player->unit_index != unit_index) return 0;
+    if (player->action_result != _player_action_result_enter_vehicle &&
+        player->action_result != _player_action_result_evict_from_vehicle) return 0;
+    if (player->action_object_index == NONE) return 0;
+
+    /* VEHICLE_PICKUP_GUARD_V10: ENTER is permitted only for an actual
+     * vehicle object; a dropped weapon or other X-action cannot show wheel. */
+    target = object_try_and_get(player->action_object_index);
+    return target && target->object.type == _object_type_vehicle;
+}
+
+/* VEHICLE_WEAPON_PICKUP_PRIORITY_V11: the on-foot Hold-X weapon/equipment
+ * prompt takes priority over ANY vehicle-HUD state. An X prompt does not
+ * mean that a vehicle is available or that the player is in a vehicle. */
+int touch_game_ground_item_prompt(void)
+{
+    long unit_index;
+    struct unit_datum *unit;
+    struct player_datum *player;
+
+    if (!touch_game_playing()) return 0;
+    unit_index = player_control_get_unit_index(0);
+    if (unit_index == NONE) return 0;
+    unit = unit_get(unit_index);
+    if (!unit || unit->unit.player_index == NONE) return 0;
+    player = player_try_and_get(unit->unit.player_index);
+    if (!player || player->unit_index != unit_index) return 0;
+
+    switch (player->action_result)
+    {
+    case _player_action_result_pickup_powerup:
+    case _player_action_result_pickup_weapon:
+    case _player_action_result_swap_for_grenades:
+    case _player_action_result_swap_for_powerup:
+    case _player_action_result_swap_for_weapon:
+    case _player_action_result_add_weapon_to_inventory:
+        return 1;
+    default:
+        return 0;
+    }
+}
+
+/* VEHICLE_OCCUPIED_V8: the player has entered a vehicle, even when
+ * an unusual/modded seat tag cannot be classified as driver/gunner/passenger.
+ * This is deliberately independent from touch_game_vehicle_hud_state(). */
+/* VEHICLE_FLIP_RELOAD_PROMPT_V18: Halo's distinct "Press X to flip"
+ * action. Only the visual X replacement is affected; gameplay remains native. */
+int touch_game_vehicle_flip_available(void)
+{
+    long unit_index;
+    struct unit_datum *unit;
+    struct player_datum *player;
+    struct object_datum *target;
+
+    if (!touch_game_playing()) return 0;
+    unit_index = player_control_get_unit_index(0);
+    if (unit_index == NONE) return 0;
+    unit = unit_get(unit_index);
+    if (!unit || unit->object.parent_object_index != NONE ||
+        unit->unit.player_index == NONE) return 0;
+    player = player_try_and_get(unit->unit.player_index);
+    if (!player || player->unit_index != unit_index ||
+        player->action_result != _player_action_result_flip_vehicle ||
+        player->action_object_index == NONE) return 0;
+    target = object_try_and_get(player->action_object_index);
+    return target && target->object.type == _object_type_vehicle;
+}
+
+int touch_game_vehicle_occupied(void)
+{
+    long unit_index;
+    struct unit_datum *unit;
+    struct object_datum *parent;
+    struct unit_datum *vehicle;
+    struct unit_definition *definition;
+    struct player_datum *player;
+
+    if (!touch_game_playing()) return 0;
+    unit_index = player_control_get_unit_index(0);
+    if (unit_index == NONE) return 0;
+    unit = unit_get(unit_index);
+    if (!unit || unit->unit.player_index == NONE ||
+        unit->object.parent_object_index == NONE ||
+        unit->unit.parent_seat_index == NONE ||
+        unit->unit.parent_seat_index < 0) return 0;
+    player = player_try_and_get(unit->unit.player_index);
+    if (!player || player->unit_index != unit_index) return 0;
+
+    /* VEHICLE_PICKUP_GUARD_V10: attached-to-something is not seated-in-car.
+     * Use the actual seat AND check the parent object's type. */
+    parent = object_try_and_get(unit->object.parent_object_index);
+    if (!parent || parent->object.type != _object_type_vehicle) return 0;
+    vehicle = unit_get(unit->object.parent_object_index);
+    if (!vehicle) return 0;
+    definition = unit_definition_get(vehicle->definition_index);
+    return definition && unit->unit.parent_seat_index < definition->unit.seats.count;
+}
+
+/* VEHICLE_GHOST_SECONDARY_V12: hide the non-existent secondary trigger
+ * for stock Ghosts. Use the seated vehicle's own tag name, not the current
+ * pickup prompt or any nearby unrelated object. Other vehicles untouched. */
+int touch_game_vehicle_is_ghost(void)
+{
+    long player_unit_index;
+    struct unit_datum *player_unit;
+    struct unit_datum *vehicle;
+    const char *name;
+
+    if (!touch_game_vehicle_occupied()) return 0;
+    player_unit_index = player_control_get_unit_index(0);
+    if (player_unit_index == NONE) return 0;
+    player_unit = unit_get(player_unit_index);
+    if (!player_unit || player_unit->object.parent_object_index == NONE) return 0;
+    vehicle = unit_get(player_unit->object.parent_object_index);
+    if (!vehicle) return 0;
+    name = tag_get_name(vehicle->definition_index);
+    return name && strstr(name, "ghost") != NULL;
+}
+
+/* Android modern HUD: report actual occupied vehicle seat and its capabilities.
+ * 0 on foot; 1 driver; 2 gunner; 3 passenger; bit 2 as used by v4
+ * for passengers; bit 3 when the DRIVER is also the vehicle GUNNER.
+ * Driver gunner is derived from Halo's seat flags/current gunner unit. */
+int touch_game_vehicle_hud_state(void)
+{
+    long unit_index;
+    struct unit_datum *unit;
+    struct unit_datum *vehicle;
+    struct unit_definition *definition;
+    struct unit_seat *seat;
+    short seat_index;
+    struct player_datum *player;
+
+    if (!touch_game_playing()) return 0;
+    unit_index = player_control_get_unit_index(0);
+    if (unit_index == NONE) return 0;
+    unit = unit_get(unit_index);
+    if (!unit || unit->unit.player_index == NONE) return 0;
+    player = player_try_and_get(unit->unit.player_index);
+    if (!player || player->unit_index != unit_index) return 0;
+    seat_index = unit->unit.parent_seat_index;
+    if (unit->object.parent_object_index == NONE || seat_index == NONE ||
+        !touch_game_vehicle_occupied()) return 0;
+
+    vehicle = unit_get(unit->object.parent_object_index);
+    if (!vehicle) return 0;
+    definition = unit_definition_get(vehicle->definition_index);
+    if (!definition || seat_index < 0 || seat_index >= definition->unit.seats.count)
+        return 0;
+    seat = TAG_BLOCK_GET_ELEMENT(&definition->unit.seats, seat_index, struct unit_seat);
+    if (!seat) return 0;
+
+    if (unit_seat_is_driver(unit->object.parent_object_index, seat_index))
+    {
+        /* On a Ghost, Banshee, Scorpion, etc. the DRIVER may also be
+         * the vehicle GUNNER. Detect the engine's actual gunner, or the
+         * seat's gunner flag. Warthog drivers without guns stay unarmed.
+         * Bit 3 of our seat-state (-> bit 7 in slots[9]) means armed pilot. */
+        int armed_driver = unit_seat_is_gunner(unit->object.parent_object_index, seat_index) ||
+            vehicle->unit.gunner_object_index == unit_index;
+        return 1 | (armed_driver ? 8 : 0);
+    }
+    if (unit_seat_is_gunner(unit->object.parent_object_index, seat_index)) return 2;
+    return 3 | (TEST_FLAG(seat->flags, 5) ? 4 : 0);
 }
 
 /* (touch_input.c's TOUCH_BUTTONS and the overlay count 16 buttons) */

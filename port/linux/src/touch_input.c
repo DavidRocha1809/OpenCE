@@ -37,6 +37,14 @@ int touch_game_cinematic_skippable(void);
 int touch_game_cinematic_playing(void);
 int touch_game_playing(void);
 #ifdef HALO_ANDROID
+int touch_game_vehicle_enter_available(void);
+int touch_game_vehicle_hud_state(void);
+int touch_game_vehicle_occupied(void);
+int touch_game_ground_item_prompt(void); /* VEHICLE_WEAPON_PICKUP_PRIORITY_V11 */
+int touch_game_vehicle_flip_available(void); /* VEHICLE_FLIP_RELOAD_PROMPT_V18 */
+int touch_game_vehicle_is_ghost(void); /* VEHICLE_GHOST_SECONDARY_V12 */
+#endif
+#ifdef HALO_ANDROID
 void menu_functions_touch_layout_update(void);
 #endif
 void touch_game_button_controls(int *controls);
@@ -316,6 +324,30 @@ void touch_input_controls(XINPUT_GAMEPAD *pad, int menus)
     {
         int slots[16];
         touch_game_weapon_slots(slots, host_touch_weapon_request());
+        /* Bit 3 of slot 9: context-sensitive vehicle enter/evict prompt.
+         * Existing weapon occupancy flags live in bits 0..2. */
+        /* VEHICLE_PICKUP_GUARD_V10: only valid, occupied vehicle seats may
+         * contribute vehicle-role bits. Outside the vehicle, only a real
+         * enter/evict vehicle target can show the wheel. */
+        /* VEHICLE_WEAPON_PICKUP_PRIORITY_V11: a real pickup message beats
+         * any stale vehicle state. Bit 9 is a one-frame ground-item guard;
+         * lower three inventory/drawer bits remain unchanged. */
+        if (touch_game_ground_item_prompt()) {
+            slots[9] = (slots[9] & 7) | 512;
+        } else if (touch_game_vehicle_occupied()) {
+            int role = touch_game_vehicle_hud_state() & 15;
+            /* Unknown/unresolved seats must NOT hide infantry controls. */
+            if ((role & 3) != 0) {
+                slots[9] |= 256 | (role << 4);
+                /* bit 10: seated in a stock Ghost; suppress LT artwork AND input. */
+                if (touch_game_vehicle_is_ghost()) slots[9] |= 1024;
+            }
+        } else if (touch_game_vehicle_enter_available()) {
+            slots[9] |= 8;
+        } else if (touch_game_vehicle_flip_available()) {
+            /* VEHICLE_FLIP_RELOAD_PROMPT_V18: bit 11, never entry or pickup. */
+            slots[9] |= 2048;
+        }
         host_touch_weapon_slots(slots);
     }
 #endif
